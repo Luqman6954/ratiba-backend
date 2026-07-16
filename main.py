@@ -32,7 +32,7 @@ except ImportError:
 app = FastAPI(
     title="UDOM Ratiba API",
     description="Fetches and converts UDOM timetable information into JSON",
-    version="2.7.0",
+    version="2.8.0",
 )
 
 BASE_URL = "https://ratiba.udom.ac.tz"
@@ -1295,6 +1295,21 @@ class PublishTimetableRequest(BaseModel):
     categoryId: str = "1"
 
 
+
+class PublishInstructorTimetableRequest(BaseModel):
+    instructorId: str
+    instructorName: str
+
+    academicYearId: str
+    semesterId: str
+
+    categoryId: str = "1"
+
+    # Optional display labels. IDs remain the authoritative scope.
+    academicYear: str = ""
+    semester: str = ""
+
+
 def clean_document_id_part(value: str) -> str:
     value = normalize_whitespace(value)
 
@@ -1676,6 +1691,374 @@ def write_official_sessions_to_firestore(
         ),
         "sessionIds": sorted(
             session_ids
+        ),
+    }
+
+
+
+# ---------------------------------------------------------------------
+# OFFICIAL LECTURER TIMETABLE PUBLICATION
+# ---------------------------------------------------------------------
+
+def build_instructor_publication_id(
+        request: PublishInstructorTimetableRequest,
+) -> str:
+    return "_".join(
+        [
+            "instructor",
+            clean_document_id_part(
+                request.academicYearId
+            ),
+            clean_document_id_part(
+                request.semesterId
+            ),
+            clean_document_id_part(
+                request.categoryId
+            ),
+            clean_document_id_part(
+                request.instructorId
+            ),
+        ]
+    )
+
+
+def build_instructor_session_identity_request(
+        request: PublishInstructorTimetableRequest,
+) -> PublishTimetableRequest:
+    """
+    Reuse the same stable official-session ID algorithm used by
+    programme publication.
+
+    Programme identity is intentionally blank because the stable
+    ID already excludes programme fields. Therefore the same real
+    UDOM session published by a programme and by an instructor
+    resolves to the same Firestore document.
+    """
+
+    return PublishTimetableRequest(
+        academicYearId=request.academicYearId,
+        academicYear=(
+            clean_display_text(
+                request.academicYear
+            )
+            or request.academicYearId
+        ),
+        semesterId=request.semesterId,
+        semester=(
+            clean_display_text(
+                request.semester
+            )
+            or f"Semester {request.semesterId}"
+        ),
+        programmeId="",
+        programmeCode="",
+        programmeName="",
+        categoryId=request.categoryId,
+    )
+
+
+def infer_lecturer_compatibility_scope(
+        request: PublishInstructorTimetableRequest,
+        session: dict,
+) -> dict:
+    """
+    TimetableDao requires course, year and semester to be non-empty.
+
+    These compatibility values are added only when an instructor
+    publication creates a brand-new Firestore document. Existing
+    programme-published documents keep their original programme
+    scope unchanged.
+    """
+
+    groups = clean_student_groups(
+        session.get("studentGroups")
+    )
+
+    first_group = (
+        groups[0]
+        if groups
+        else ""
+    )
+
+    study_year = extract_study_year(
+        first_group
+    )
+
+    course_value = (
+        first_group
+        or clean_display_text(
+            request.instructorName
+        )
+        or "Official Lecturer Timetable"
+    )
+
+    year_value = (
+        f"Year {study_year}"
+        if study_year is not None
+        else "Lecturer"
+    )
+
+    semester_value = (
+        clean_display_text(
+            request.semester
+        )
+        or f"Semester {request.semesterId}"
+    )
+
+    return {
+        "course": course_value,
+        "year": year_value,
+        "semester": semester_value,
+    }
+
+
+def build_instructor_session_document(
+        request: PublishInstructorTimetableRequest,
+        session: dict,
+        session_id: str,
+        publication_id: str,
+        *,
+        is_existing: bool,
+) -> dict:
+    student_groups = clean_student_groups(
+        session.get("studentGroups")
+    )
+
+    document = {
+        "firebaseId": session_id,
+        "officialSessionId": session_id,
+
+        "academicYearId": request.academicYearId,
+        "academicYear": (
+            clean_display_text(
+                request.academicYear
+            )
+            or request.academicYearId
+        ),
+        "semesterId": request.semesterId,
+        "categoryId": request.categoryId,
+        "category": (
+            clean_display_text(
+                session.get("category")
+            )
+            or "Teaching"
+        ),
+
+        "courseCode": clean_display_text(
+            session.get("courseCode")
+        ),
+        "courseName": clean_display_text(
+            session.get("courseName")
+        ),
+        "lecturerName": (
+            clean_display_text(
+                session.get("lecturerName")
+            )
+            or clean_display_text(
+                request.instructorName
+            )
+        ),
+        "day": clean_display_text(
+            session.get("day")
+        ),
+        "startTime": clean_display_text(
+            session.get("startTime")
+        ),
+        "endTime": clean_display_text(
+            session.get("endTime")
+        ),
+        "venue": clean_display_text(
+            session.get("venue")
+        ),
+        "sessionType": clean_display_text(
+            session.get("sessionType")
+        ),
+        "group": clean_display_text(
+            session.get("group")
+        ),
+
+        "lecturerIds": firestore.ArrayUnion(
+            [request.instructorId]
+        ),
+        "lecturerNames": firestore.ArrayUnion(
+            [request.instructorName]
+        ),
+        "instructorPublicationIds": firestore.ArrayUnion(
+            [publication_id]
+        ),
+
+        "source": "UDOM_RATIBA",
+        "official": True,
+        "active": True,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+
+    if student_groups:
+        document["studentGroups"] = firestore.ArrayUnion(
+            student_groups
+        )
+    elif not is_existing:
+        document["studentGroups"] = []
+
+    if not is_existing:
+        document.update(
+            infer_lecturer_compatibility_scope(
+                request,
+                session,
+            )
+        )
+
+        document.update(
+            {
+                "publicationId": publication_id,
+                "sessionStatus": "Pending",
+
+                "oneHourReminderSent": False,
+                "lecturerReminderSent": False,
+                "crReminderSent": False,
+                "crFollowUpReminderSent": False,
+            }
+        )
+
+    return document
+
+
+def write_official_instructor_sessions_to_firestore(
+        request: PublishInstructorTimetableRequest,
+        sessions: list[dict],
+) -> dict:
+    if firestore_db is None:
+        raise RuntimeError(
+            "Firebase is not configured"
+        )
+
+    if not sessions:
+        raise ValueError(
+            "Cannot publish an empty lecturer timetable"
+        )
+
+    publication_id = build_instructor_publication_id(
+        request
+    )
+
+    identity_request = (
+        build_instructor_session_identity_request(
+            request
+        )
+    )
+
+    unique_sessions = {}
+
+    for session in sessions:
+        session_id = build_official_session_id(
+            identity_request,
+            session,
+        )
+
+        unique_sessions[session_id] = session
+
+    session_refs = {
+        session_id: (
+            firestore_db
+            .collection("timetables")
+            .document(session_id)
+        )
+        for session_id in unique_sessions
+    }
+
+    existing_ids = set()
+
+    for snapshot in firestore_db.get_all(
+            list(session_refs.values())
+    ):
+        if snapshot.exists:
+            existing_ids.add(
+                snapshot.id
+            )
+
+    batch = firestore_db.batch()
+
+    for session_id, session in (
+            unique_sessions.items()
+    ):
+        document = build_instructor_session_document(
+            request,
+            session,
+            session_id,
+            publication_id,
+            is_existing=(
+                session_id in existing_ids
+            ),
+        )
+
+        batch.set(
+            session_refs[session_id],
+            document,
+            merge=True,
+        )
+
+    publication_ref = (
+        firestore_db
+        .collection(
+            "instructorTimetablePublications"
+        )
+        .document(publication_id)
+    )
+
+    publication_document = {
+        "publicationId": publication_id,
+
+        "instructorId": request.instructorId,
+        "instructorName": request.instructorName,
+
+        "academicYearId": request.academicYearId,
+        "academicYear": (
+            clean_display_text(
+                request.academicYear
+            )
+            or request.academicYearId
+        ),
+
+        "semesterId": request.semesterId,
+        "semester": (
+            clean_display_text(
+                request.semester
+            )
+            or f"Semester {request.semesterId}"
+        ),
+
+        "categoryId": request.categoryId,
+
+        "sessionCount": len(
+            unique_sessions
+        ),
+        "sessionIds": sorted(
+            unique_sessions.keys()
+        ),
+
+        "source": "UDOM_RATIBA",
+        "status": "PUBLISHED",
+        "active": True,
+
+        "publishedAt": firestore.SERVER_TIMESTAMP,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+
+    batch.set(
+        publication_ref,
+        publication_document,
+        merge=True,
+    )
+
+    batch.commit()
+
+    return {
+        "publicationId": publication_id,
+        "sessionCount": len(
+            unique_sessions
+        ),
+        "sessionIds": sorted(
+            unique_sessions.keys()
         ),
     }
 
@@ -3360,3 +3743,135 @@ def publish_timetable(
                 f"{error}"
             ),
         ) from error
+
+
+@app.post("/publish-instructor-timetable")
+def publish_instructor_timetable(
+        request: PublishInstructorTimetableRequest,
+):
+    """
+    Fetch the selected lecturer's complete official UDOM timetable,
+    upsert it into Firestore, and make it available to the existing
+    Firestore-to-Room lecturer synchronization flow.
+    """
+
+    if firestore_db is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Firebase is not configured on "
+                "this server. Set "
+                "firebase_service_account_b64 "
+                "before publishing."
+            ),
+        )
+
+    if not clean_display_text(
+            request.instructorId
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Instructor ID is required",
+        )
+
+    if not clean_display_text(
+            request.instructorName
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Instructor name is required",
+        )
+
+    publication_id = (
+        build_instructor_publication_id(
+            request
+        )
+    )
+
+    publication_ref = (
+        firestore_db
+        .collection(
+            "instructorTimetablePublications"
+        )
+        .document(publication_id)
+    )
+
+    try:
+        existing_publication = (
+            publication_ref.get()
+        )
+
+        html = (
+            download_instructor_timetable_html(
+                request.instructorId,
+                request.academicYearId,
+                request.semesterId,
+                request.categoryId,
+            )
+        )
+
+        timetable = parse_instructor_timetable(
+            html,
+            request.instructorId,
+        )
+
+        sessions = (
+            timetable.get("sessions")
+            or []
+        )
+
+        if not sessions:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "UDOM returned no sessions for "
+                    "the selected lecturer"
+                ),
+            )
+
+        publication_result = (
+            write_official_instructor_sessions_to_firestore(
+                request,
+                sessions,
+            )
+        )
+
+        return {
+            "success": True,
+            "alreadyPublished": (
+                existing_publication.exists
+            ),
+            "instructorId": (
+                request.instructorId
+            ),
+            "instructorName": (
+                request.instructorName
+            ),
+            "message": (
+                "Official lecturer timetable published"
+            ),
+            **publication_result,
+        }
+
+    except HTTPException:
+        raise
+
+    except requests.RequestException as error:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Could not contact UDOM Ratiba "
+                "while loading the lecturer timetable: "
+                f"{error}"
+            ),
+        ) from error
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to publish lecturer timetable: "
+                f"{error}"
+            ),
+        ) from error
+
