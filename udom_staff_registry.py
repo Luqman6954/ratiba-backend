@@ -110,7 +110,28 @@ def extract_instructor_unit(value: str | None) -> str:
     return normalize_academic_unit_code(match.group(1))
 
 def _initial_compatible(left: str, right: str) -> bool:
-    return bool(left and right and left[0] == right[0])
+    if not left or not right:
+        return False
+
+    if left == right:
+        return True
+
+    # Allow a real initial only when one source actually uses
+    # a one-letter first-name token, e.g. "J" vs "John".
+    if len(left) == 1 or len(right) == 1:
+        return left[0] == right[0]
+
+    # Allow small spelling variations such as:
+    # Samwel <-> Samuel.
+    #
+    # Do NOT consider two complete names compatible merely
+    # because they begin with the same letter:
+    # Ambrose <-> Augustino must fail.
+    return SequenceMatcher(
+        None,
+        left,
+        right,
+    ).ratio() >= 0.80
 
 
 def name_match_score(first: str | None, second: str | None) -> float:
