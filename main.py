@@ -10,11 +10,12 @@ from typing import Any
 
 import requests
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 import firebase_admin
+from firebase_admin import auth as firebase_auth
 from firebase_admin import credentials, firestore
 
 try:
@@ -32,7 +33,7 @@ except ImportError:
 app = FastAPI(
     title="UDOM Ratiba API",
     description="Fetches and converts UDOM timetable information into JSON",
-    version="2.8.0",
+    version="2.9.0",
 )
 
 BASE_URL = "https://ratiba.udom.ac.tz"
@@ -1279,6 +1280,184 @@ def initialize_firestore():
 
 
 firestore_db = initialize_firestore()
+
+
+# ---------------------------------------------------------------------
+# PHASE 1B - AUTOMATIC LECTURER AUTHORIZATION
+# ---------------------------------------------------------------------
+
+class LecturerAutoProvisionRequest(BaseModel):
+    instructorId: str
+    academicYearId: str
+    semesterId: str
+    categoryId: str = "1"
+
+
+LECTURER_REGISTRY_MIN_SCORE = 0.86
+
+
+def _authorization_error(status_code: int, code: str, message: str):
+    raise HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message},
+    )
+
+
+def require_verified_firebase_user(authorization: str | None) -> dict:
+    if firestore_db is None:
+        _authorization_error(
+            503,
+            "FIREBASE_NOT_CONFIGURED",
+            "Lecturer verification is unavailable because Firebase Admin is not configured",
+        )
+
+    if not authorization:
+        _authorization_error(401, "AUTH_REQUIRED", "A Firebase ID token is required")
+
+    scheme, separator, token = authorization.partition(" ")
+    if separator != " " or scheme.lower() != "bearer" or not token.strip():
+        _authorization_error(
+            401,
+            "INVALID_AUTHORIZATION_HEADER",
+            "Use Authorization: Bearer <Firebase ID token>",
+        )
+
+    try:
+        claims = firebase_auth.verify_id_token(token.strip(), check_revoked=True)
+    except Exception:
+        _authorization_error(401, "INVALID_FIREBASE_TOKEN", "Firebase authentication failed")
+
+    uid = normalize_whitespace(claims.get("uid") or claims.get("sub"))
+    if not uid:
+        _authorization_error(401, "MISSING_FIREBASE_UID", "Authenticated token has no UID")
+
+    claims["uid"] = uid
+    return claims
+
+
+def normalize_institutional_email(value: str | None) -> str:
+    return normalize_whitespace(value).lower()
+
+
+def get_udom_staff_registry_record(email: str):
+    snapshot = (
+        firestore_db
+        .collection("udom_staff_registry")
+        .document(email)
+        .get()
+    )
+    if not snapshot.exists:
+        return None
+    data = snapshot.to_dict() or {}
+    data["_documentId"] = snapshot.id
+    return data
+
+
+def find_official_instructor(
+        instructor_id: str,
+        academic_year_id: str,
+        semester_id: str,
+        category_id: str,
+):
+    instructor_id = normalize_whitespace(instructor_id)
+    if not instructor_id:
+        return None
+
+    cache_key = (
+        "instructors",
+        academic_year_id,
+        semester_id,
+        category_id,
+    )
+    instructors = get_cached_reference(cache_key)
+    if instructors is None:
+        instructors = download_instructors(
+            academic_year_id,
+            semester_id,
+            category_id,
+        )
+        save_cached_reference(cache_key, instructors)
+
+    for instructor in instructors:
+        current_id = normalize_whitespace(
+            instructor.get("instructorId") or instructor.get("id")
+        )
+        if current_id == instructor_id:
+            return instructor
+    return None
+
+
+def grant_lecturer_role(
+        *, uid: str, email: str, staff_record: dict,
+        instructor: dict, request: LecturerAutoProvisionRequest,
+) -> dict:
+    instructor_id = normalize_whitespace(
+        instructor.get("instructorId") or instructor.get("id")
+    )
+    instructor_name = normalize_whitespace(
+        instructor.get("instructorName") or instructor.get("name")
+    )
+    staff_name = normalize_whitespace(staff_record.get("fullName"))
+
+    binding_ref = firestore_db.collection("lecturer_bindings").document(uid)
+    existing = binding_ref.get()
+
+    binding = {
+        "uid": uid,
+        "role": "LECTURER",
+        "active": True,
+        "verified": True,
+        "institutionalEmail": email,
+        "instructorId": instructor_id,
+        "instructorName": instructor_name,
+        "staffDirectoryName": staff_name,
+        "staffProfileUrl": normalize_whitespace(staff_record.get("profileUrl")),
+        "academicYearId": request.academicYearId,
+        "semesterId": request.semesterId,
+        "categoryId": request.categoryId,
+        "verificationMethod": (
+            "FIREBASE_VERIFIED_UDOM_EMAIL+"
+            "UDOM_PUBLIC_STAFF_DIRECTORY+"
+            "UDOM_RATIBA_INSTRUCTOR_MATCH"
+        ),
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    if not existing.exists:
+        binding["createdAt"] = firestore.SERVER_TIMESTAMP
+    binding_ref.set(binding, merge=True)
+
+    # Server-controlled custom claims are the trusted coarse role identity.
+    user_record = firebase_auth.get_user(uid)
+    claims = dict(user_record.custom_claims or {})
+    claims["ratibaRole"] = "LECTURER"
+    claims["ratibaInstructorId"] = instructor_id
+    firebase_auth.set_custom_user_claims(uid, claims)
+
+    # Keep the current Android profile compatible, but Firestore rules must
+    # NOT use users/{uid}.role as the authorization source.
+    firestore_db.collection("users").document(uid).set(
+        {
+            "role": "LECTURER",
+            "email": email,
+            "ratibaInstructorId": instructor_id,
+            "verificationStatus": "VERIFIED_UDOM_STAFF",
+            "accountStatus": "Active",
+            "updatedAtMillis": int(time.time() * 1000),
+        },
+        merge=True,
+    )
+
+    return {
+        "uid": uid,
+        "role": "LECTURER",
+        "verified": True,
+        "institutionalEmail": email,
+        "instructorId": instructor_id,
+        "instructorName": instructor_name,
+        "staffDirectoryName": staff_name,
+        "refreshFirebaseToken": True,
+    }
+
 
 
 class PublishTimetableRequest(BaseModel):
@@ -3257,6 +3436,157 @@ def get_instructors(
             status_code=503,
             detail=str(error),
         ) from error
+
+
+
+
+
+@app.post("/auth/lecturer/auto-provision")
+def auto_provision_lecturer(
+        request: LecturerAutoProvisionRequest,
+        authorization: str | None = Header(default=None),
+):
+    """Grant Lecturer only after trusted institutional checks pass."""
+
+    from udom_staff_registry import name_match_score
+
+    claims = require_verified_firebase_user(authorization)
+    uid = claims["uid"]
+    email = normalize_institutional_email(claims.get("email"))
+
+    if not email.endswith("@udom.ac.tz"):
+        _authorization_error(
+            403,
+            "UDOM_EMAIL_REQUIRED",
+            "Lecturer accounts must use an institutional @udom.ac.tz Firebase email",
+        )
+
+    if claims.get("email_verified") is not True:
+        _authorization_error(
+            403,
+            "EMAIL_NOT_VERIFIED",
+            "Verify the institutional email in Firebase before lecturer setup",
+        )
+
+    staff_record = get_udom_staff_registry_record(email)
+    if not staff_record or staff_record.get("active") is False:
+        _authorization_error(
+            403,
+            "NOT_IN_UDOM_STAFF_REGISTRY",
+            "The verified institutional email was not found in the synchronized UDOM staff registry",
+        )
+
+    registry_score = float(staff_record.get("matchScore") or 0.0)
+    if registry_score < LECTURER_REGISTRY_MIN_SCORE:
+        _authorization_error(
+            409,
+            "STAFF_MATCH_NEEDS_REVIEW",
+            "The staff-directory record is not strong enough for automatic role assignment",
+        )
+
+    try:
+        instructor = find_official_instructor(
+            request.instructorId,
+            request.academicYearId,
+            request.semesterId,
+            request.categoryId,
+        )
+    except requests.RequestException as error:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "UDOM_RATIBA_UNAVAILABLE",
+                "message": f"Could not verify the official instructor list: {error}",
+            },
+        ) from error
+
+    if instructor is None:
+        _authorization_error(
+            404,
+            "INSTRUCTOR_NOT_FOUND",
+            "The selected instructor is not in the official Ratiba instructor list for this academic scope",
+        )
+
+    official_instructor_id = normalize_whitespace(
+        instructor.get("instructorId") or instructor.get("id")
+    )
+    registry_instructor_id = normalize_whitespace(staff_record.get("instructorId"))
+    if registry_instructor_id and registry_instructor_id != official_instructor_id:
+        _authorization_error(
+            409,
+            "INSTRUCTOR_BINDING_MISMATCH",
+            "The verified staff email is linked to a different official Ratiba instructor",
+        )
+
+    instructor_name = normalize_whitespace(
+        instructor.get("instructorName") or instructor.get("name")
+    )
+    staff_name = normalize_whitespace(staff_record.get("fullName"))
+    live_score = name_match_score(staff_name, instructor_name)
+    if live_score < 0.86:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "LECTURER_IDENTITY_NEEDS_REVIEW",
+                "message": (
+                    "Institutional email is verified, but the UDOM staff name "
+                    "does not safely match the selected Ratiba instructor"
+                ),
+                "staffDirectoryName": staff_name,
+                "instructorName": instructor_name,
+                "matchScore": live_score,
+            },
+        )
+
+    return {
+        "success": True,
+        "message": "Lecturer identity verified and role granted automatically",
+        "binding": grant_lecturer_role(
+            uid=uid,
+            email=email,
+            staff_record=staff_record,
+            instructor=instructor,
+            request=request,
+        ),
+    }
+
+
+@app.get("/auth/me")
+def get_my_authorization(
+        authorization: str | None = Header(default=None),
+):
+    claims = require_verified_firebase_user(authorization)
+    uid = claims["uid"]
+
+    lecturer_snapshot = firestore_db.collection("lecturer_bindings").document(uid).get()
+    if lecturer_snapshot.exists:
+        binding = lecturer_snapshot.to_dict() or {}
+        if binding.get("active") is True and binding.get("verified") is True:
+            return {
+                "uid": uid,
+                "role": "LECTURER",
+                "authorizationSource": "lecturer_bindings",
+                "binding": binding,
+                "tokenRole": claims.get("ratibaRole"),
+                "tokenRefreshRequired": claims.get("ratibaRole") != "LECTURER",
+            }
+
+    cr_snapshot = firestore_db.collection("cr_assignments").document(uid).get()
+    if cr_snapshot.exists:
+        assignment = cr_snapshot.to_dict() or {}
+        if assignment.get("active") is True:
+            return {
+                "uid": uid,
+                "role": "CR",
+                "authorizationSource": "cr_assignments",
+                "assignment": assignment,
+            }
+
+    return {
+        "uid": uid,
+        "role": "STUDENT",
+        "authorizationSource": "default",
+    }
 
 
 @app.get("/timetable/{programme_id}")
