@@ -47,6 +47,10 @@ def normalize_person_name(value: str | None) -> str:
     if not value:
         return ""
 
+    # Ratiba instructor labels append an academic unit, for example:
+    # "Dr. Lulu Tunu Kaaya (CNMS)". The suffix is not part of the name.
+    value = re.sub(r"\s*\([^)]*\)\s*$", "", value)
+
     decomposed = unicodedata.normalize("NFD", value)
     value = "".join(
         character
@@ -59,6 +63,51 @@ def normalize_person_name(value: str | None) -> str:
     tokens = [token for token in value.split() if token not in TITLE_WORDS]
     return " ".join(tokens)
 
+
+
+def normalize_academic_unit_code(value: str | None) -> str:
+    value = normalize_whitespace(value).upper()
+    if not value:
+        return ""
+
+    value = value.replace(" AND ", " & ")
+    value = re.sub(r"[^A-Z0-9&/]+", " ", value)
+    return " ".join(value.split()).strip()
+
+
+def academic_unit_parts(value: str | None) -> set[str]:
+    normalized = normalize_academic_unit_code(value)
+    if not normalized:
+        return set()
+
+    parts = {
+        part.strip()
+        for part in re.split(r"\s*(?:&|/)\s*", normalized)
+        if part.strip()
+    }
+    parts.add(normalized)
+    return parts
+
+
+def academic_units_compatible(
+    staff_unit: str | None,
+    instructor_unit: str | None,
+) -> bool:
+    left = academic_unit_parts(staff_unit)
+    right = academic_unit_parts(instructor_unit)
+    return bool(left and right and (left & right))
+
+
+def extract_instructor_unit(value: str | None) -> str:
+    label = normalize_whitespace(value)
+    if not label:
+        return ""
+
+    match = re.search(r"\(([^()]*)\)\s*$", label)
+    if match is None:
+        return ""
+
+    return normalize_academic_unit_code(match.group(1))
 
 def _initial_compatible(left: str, right: str) -> bool:
     return bool(left and right and left[0] == right[0])
@@ -275,23 +324,221 @@ def extract_profile_name(soup: BeautifulSoup) -> str:
     return ""
 
 
-def extract_staff_profile(html: str, profile_url: str) -> dict:
-    soup = BeautifulSoup(html, "html.parser")
-    page_text = soup.get_text(" ", strip=True)
 
-    official_emails = sorted(
+def extract_profile_metadata(soup: BeautifulSoup) -> dict:
+    """Extract identity metadata from the staff-specific profile section."""
+
+    lines = [
+        normalize_whitespace(line)
+        for line in soup.get_text("\n").splitlines()
+        if normalize_whitespace(line)
+    ]
+
+    department = ""
+    academic_unit_code = ""
+    title = ""
+    department_index = None
+
+    for index, line in enumerate(lines):
+        if not title:
+            match = re.match(
+                r"^Title\s*:?\s*(.+)$",
+                line,
+                re.IGNORECASE,
+            )
+            if match:
+                title = normalize_whitespace(
+                    match.group(1)
+                )
+
+        if not department:
+            match = re.match(
+                r"^Department\s*:?\s*(.+)$",
+                line,
+                re.IGNORECASE,
+            )
+            if match:
+                department = normalize_whitespace(
+                    match.group(1)
+                )
+                department_index = index
+
+    # The genuine College/School value occurs beside the staff
+    # Department in the profile section. Do not scan the site's
+    # navigation menu for academic-unit names.
+    if department_index is not None:
+        nearby_lines = lines[
+            department_index + 1:
+            department_index + 8
+        ]
+
+        for line in nearby_lines:
+            match = re.match(
+                r"^(?:College|School|Institute)\s*:?\s*(.+)$",
+                line,
+                re.IGNORECASE,
+            )
+
+            if not match:
+                continue
+
+            candidate = normalize_whitespace(
+                match.group(1)
+            )
+
+            if not candidate:
+                continue
+
+            # Reject navigation-style values such as:
+            # "College of Business and Economics".
+            if candidate.lower().startswith("of "):
+                continue
+
+            if (
+                len(candidate) <= 32
+                and len(candidate.split()) <= 5
+            ):
+                academic_unit_code = (
+                    normalize_academic_unit_code(
+                        candidate
+                    )
+                )
+                break
+
+    return {
+        "department": department,
+        "academicUnitCode": academic_unit_code,
+        "title": title,
+    }
+
+
+GENERIC_UDOM_EMAIL_LOCALS = {
+    "info",
+    "admin",
+    "support",
+    "helpdesk",
+    "webmaster",
+    "admission",
+    "admissions",
+    "registrar",
+    "ict",
+    "library",
+    "accounts",
+    "finance",
+    "hr",
+    "humanresources",
+}
+
+
+def institutional_email_matches_name(
+    email: str,
+    full_name: str,
+) -> bool:
+    """
+    Accept only personal-looking @udom.ac.tz addresses.
+
+    Generic site addresses such as info@udom.ac.tz must never
+    be used for automatic lecturer provisioning.
+    """
+
+    email = normalize_institutional_email(email)
+
+    if not email.endswith("@udom.ac.tz"):
+        return False
+
+    local_part = email.split("@", 1)[0].lower()
+
+    # Ignore trailing digits, e.g. samwel.marwa2.
+    generic_check = re.sub(
+        r"\d+$",
+        "",
+        local_part,
+    )
+
+    if generic_check in GENERIC_UDOM_EMAIL_LOCALS:
+        return False
+
+    normalized_name = normalize_person_name(
+        full_name
+    )
+
+    name_tokens = [
+        token
+        for token in normalized_name.split()
+        if len(token) >= 3
+    ]
+
+    if not name_tokens:
+        return False
+
+    compact_local = re.sub(
+        r"[^a-z]",
+        "",
+        local_part,
+    )
+
+    # At least one meaningful part of the person's name must
+    # appear in the institutional email username.
+    return any(
+        token in compact_local
+        for token in name_tokens
+    )
+
+
+def extract_staff_profile(
+    html: str,
+    profile_url: str,
+) -> dict:
+    soup = BeautifulSoup(
+        html,
+        "html.parser",
+    )
+
+    page_text = soup.get_text(
+        " ",
+        strip=True,
+    )
+
+    profile_name = extract_profile_name(
+        soup
+    )
+
+    candidate_emails = sorted(
         {
             normalize_institutional_email(email)
-            for email in EMAIL_PATTERN.findall(page_text)
-            if normalize_institutional_email(email).endswith("@udom.ac.tz")
+            for email in EMAIL_PATTERN.findall(
+                page_text
+            )
+            if normalize_institutional_email(
+                email
+            ).endswith("@udom.ac.tz")
         }
     )
 
+    metadata = extract_profile_metadata(
+        soup
+    )
+
     return {
-        "fullName": extract_profile_name(soup),
-        "officialEmails": official_emails,
+        "fullName": profile_name,
+        "candidateEmails": candidate_emails,
+        "officialEmails": [],
         "profileUrl": profile_url,
-        "source": "UDOM_PUBLIC_STAFF_DIRECTORY",
+        "department": metadata.get(
+            "department",
+            "",
+        ),
+        "academicUnitCode": metadata.get(
+            "academicUnitCode",
+            "",
+        ),
+        "title": metadata.get(
+            "title",
+            "",
+        ),
+        "source": (
+            "UDOM_PUBLIC_STAFF_DIRECTORY"
+        ),
     }
 
 
@@ -299,12 +546,53 @@ def fetch_staff_profile(
     session: requests.Session,
     entry: StaffIndexEntry,
 ) -> dict:
-    response = session.get(entry.profile_url, timeout=DEFAULT_TIMEOUT)
+    response = session.get(
+        entry.profile_url,
+        timeout=DEFAULT_TIMEOUT,
+    )
+
     response.raise_for_status()
-    record = extract_staff_profile(response.text, entry.profile_url)
+
+    record = extract_staff_profile(
+        response.text,
+        entry.profile_url,
+    )
+
     if not record.get("fullName"):
-        record["fullName"] = entry.full_name
-    record["availabilityStatus"] = entry.availability_status
+        record["fullName"] = (
+            entry.full_name
+        )
+
+    candidate_emails = record.pop(
+        "candidateEmails",
+        [],
+    )
+
+    accepted_emails = [
+        email
+        for email in candidate_emails
+        if institutional_email_matches_name(
+            email,
+            record["fullName"],
+        )
+    ]
+
+    record["officialEmails"] = (
+        accepted_emails
+    )
+
+    record[
+        "rejectedInstitutionalEmails"
+    ] = [
+        email
+        for email in candidate_emails
+        if email not in accepted_emails
+    ]
+
+    record["availabilityStatus"] = (
+        entry.availability_status
+    )
+
     return record
 
 

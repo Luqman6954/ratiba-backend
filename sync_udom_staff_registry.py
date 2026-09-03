@@ -11,10 +11,13 @@ from firebase_admin import credentials, firestore
 
 import main as ratiba_main
 from udom_staff_registry import (
+    academic_units_compatible,
     best_instructor_matches,
     create_session,
     crawl_staff_index,
+    extract_instructor_unit,
     fetch_staff_profile,
+    normalize_academic_unit_code,
     normalize_institutional_email,
     shortlist_entries_for_instructors,
 )
@@ -34,18 +37,85 @@ def initialize_firestore():
     return firestore.client(app=app)
 
 
-def build_registry_document(profile: dict, instructors: list[dict]) -> tuple[str, dict] | None:
+def build_registry_document(
+    profile: dict,
+    instructors: list[dict],
+) -> tuple[str, dict] | None:
     staff_name = profile.get("fullName", "")
     ranked = best_instructor_matches(staff_name, instructors)
     if not ranked:
         return None
 
-    best_score, best = ranked[0]
-    second_score = ranked[1][0] if len(ranked) > 1 else 0.0
-
-    # Require a strong match and enough separation from a second candidate.
-    if best_score < 0.86 or (second_score >= 0.80 and best_score - second_score < 0.05):
+    strong = [
+        (score, instructor)
+        for score, instructor in ranked
+        if score >= 0.86
+    ]
+    if not strong:
         return None
+
+    best_score, best = strong[0]
+    second_score = strong[1][0] if len(strong) > 1 else 0.0
+
+    staff_unit = normalize_academic_unit_code(
+        profile.get("academicUnitCode", "")
+    )
+
+    # If name-only matching produces two nearly identical candidates,
+    # resolve the identity using the official UDOM academic unit.
+    ambiguous_name = (
+        second_score >= 0.80
+        and best_score - second_score < 0.05
+    )
+
+    match_basis = "NAME"
+
+    if ambiguous_name:
+        unit_compatible = []
+
+        for score, instructor in strong:
+            instructor_name = str(
+                instructor.get("instructorName")
+                or instructor.get("name")
+                or ""
+            ).strip()
+
+            instructor_unit = extract_instructor_unit(
+                instructor_name
+            )
+
+            if academic_units_compatible(
+                staff_unit,
+                instructor_unit,
+            ):
+                unit_compatible.append(
+                    (score, instructor)
+                )
+
+        if not unit_compatible:
+            return None
+
+        unit_compatible.sort(
+            key=lambda item: item[0],
+            reverse=True,
+        )
+
+        best_score, best = unit_compatible[0]
+        unit_second_score = (
+            unit_compatible[1][0]
+            if len(unit_compatible) > 1
+            else 0.0
+        )
+
+        # Even unit-aware matching must still result in one clear identity.
+        if (
+            len(unit_compatible) > 1
+            and unit_second_score >= 0.80
+            and best_score - unit_second_score < 0.05
+        ):
+            return None
+
+        match_basis = "NAME+ACADEMIC_UNIT"
 
     emails = [
         normalize_institutional_email(email)
@@ -55,23 +125,40 @@ def build_registry_document(profile: dict, instructors: list[dict]) -> tuple[str
     if not emails:
         return None
 
-    instructor_id = str(best.get("instructorId") or best.get("id") or "").strip()
-    instructor_name = str(best.get("instructorName") or best.get("name") or "").strip()
+    instructor_id = str(
+        best.get("instructorId")
+        or best.get("id")
+        or ""
+    ).strip()
+
+    instructor_name = str(
+        best.get("instructorName")
+        or best.get("name")
+        or ""
+    ).strip()
+
     if not instructor_id or not instructor_name:
         return None
 
-    # A staff profile can occasionally expose more than one institutional
-    # address. Create one record per email later; return the shared payload.
+    instructor_unit = extract_instructor_unit(
+        instructor_name
+    )
+
     payload = {
         "fullName": staff_name,
         "profileUrl": profile.get("profileUrl", ""),
         "availabilityStatus": profile.get("availabilityStatus", ""),
+        "department": profile.get("department", ""),
+        "academicUnitCode": staff_unit,
         "instructorId": instructor_id,
         "instructorName": instructor_name,
+        "instructorUnitCode": instructor_unit,
         "matchScore": best_score,
+        "matchBasis": match_basis,
         "active": True,
         "source": "UDOM_PUBLIC_STAFF_DIRECTORY+UDOM_RATIBA",
     }
+
     return "|".join(sorted(set(emails))), payload
 
 
@@ -137,10 +224,17 @@ def main() -> int:
                         "institutionalEmail": email,
                     }
 
+                unit_note = (
+                    f" unit={payload.get('academicUnitCode')}"
+                    if payload.get("academicUnitCode")
+                    else ""
+                )
+
                 print(
                     f"[{index}/{len(shortlisted)}] MATCH "
                     f"{payload['fullName']} -> {payload['instructorName']} "
-                    f"({payload['matchScore']:.3f})"
+                    f"({payload['matchScore']:.3f}) "
+                    f"[{payload.get('matchBasis', 'NAME')}{unit_note}]"
                 )
             except Exception as error:
                 print(f"WARN {entry.full_name}: {error}", file=sys.stderr)
