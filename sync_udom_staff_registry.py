@@ -10,6 +10,8 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 import main as ratiba_main
+AUTO_MATCH_THRESHOLD = 0.94
+
 from udom_staff_registry import (
     academic_units_compatible,
     best_instructor_matches,
@@ -50,7 +52,7 @@ def build_registry_document(
     strong = [
         (score, instructor)
         for score, instructor in ranked
-        if score >= 0.86
+        if score >= AUTO_MATCH_THRESHOLD
     ]
     if not strong:
         return None
