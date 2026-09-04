@@ -19,6 +19,7 @@ from udom_staff_registry import (
     fetch_staff_profile,
     normalize_academic_unit_code,
     normalize_institutional_email,
+    normalize_person_name,
     shortlist_entries_for_instructors,
 )
 
@@ -143,6 +144,51 @@ def build_registry_document(
     instructor_unit = extract_instructor_unit(
         instructor_name
     )
+
+    # Final identity-shape safety guard.
+    #
+    # Name-only auto-provisioning is allowed when:
+    #   1. first and last names agree, even if middle names are omitted, OR
+    #   2. the same exact name tokens are merely reordered.
+    #
+    # If those structural signals disagree, a matching academic unit
+    # is required. Otherwise the record stays for manual review.
+    staff_normalized = normalize_person_name(
+        staff_name
+    )
+    instructor_normalized = normalize_person_name(
+        instructor_name
+    )
+
+    staff_tokens = staff_normalized.split()
+    instructor_tokens = instructor_normalized.split()
+
+    if not staff_tokens or not instructor_tokens:
+        return None
+
+    same_first = (
+        staff_tokens[0] == instructor_tokens[0]
+    )
+    same_last = (
+        staff_tokens[-1] == instructor_tokens[-1]
+    )
+    same_token_set = (
+        set(staff_tokens) == set(instructor_tokens)
+    )
+
+    safe_name_only_shape = (
+        (same_first and same_last)
+        or same_token_set
+    )
+
+    if not safe_name_only_shape:
+        if not academic_units_compatible(
+            staff_unit,
+            instructor_unit,
+        ):
+            return None
+
+        match_basis = "NAME+ACADEMIC_UNIT"
 
     payload = {
         "fullName": staff_name,
