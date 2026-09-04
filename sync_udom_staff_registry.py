@@ -5,6 +5,9 @@ import base64
 import json
 import os
 import sys
+import time
+
+import requests
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -210,6 +213,41 @@ def build_registry_document(
     return "|".join(sorted(set(emails))), payload
 
 
+
+def fetch_staff_profile_with_retry(
+    session,
+    entry,
+    retries: int,
+):
+    """Fetch one UDOM staff profile with conservative retries."""
+
+    attempts = max(1, retries + 1)
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return fetch_staff_profile(session, entry)
+
+        except requests.RequestException as error:
+            if attempt >= attempts:
+                raise
+
+            wait_seconds = min(
+                15.0,
+                3.0 * attempt,
+            )
+
+            print(
+                f"WARN temporary UDOM request failure "
+                f"for {entry.full_name} "
+                f"(attempt {attempt}/{attempts}); "
+                f"retrying in {wait_seconds:.1f}s: "
+                f"{error}",
+                file=sys.stderr,
+            )
+
+            time.sleep(wait_seconds)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Prepare/sync the UDOM staff registry used by Ratiba lecturer auto-provisioning"
@@ -220,6 +258,25 @@ def main() -> int:
     parser.add_argument("--max-pages", type=int, default=60)
     parser.add_argument("--max-profiles", type=int, default=0,
                         help="For testing only: stop after N shortlisted profiles (0 = all)")
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Skip the first N shortlisted staff profiles",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=2.0,
+        help="Seconds to wait after processing each profile",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=2,
+        help="Additional retries for temporary UDOM request failures",
+    )
+
     parser.add_argument("--write", action="store_true",
                         help="Actually write Firestore. Without this flag the command is a dry run.")
     args = parser.parse_args()
@@ -241,20 +298,40 @@ def main() -> int:
     staff_entries = crawl_staff_index(max_pages=max(1, args.max_pages))
     print(f"UDOM staff index entries: {len(staff_entries)}")
 
-    shortlisted = shortlist_entries_for_instructors(staff_entries, instructor_names)
+    all_shortlisted = shortlist_entries_for_instructors(
+        staff_entries,
+        instructor_names,
+    )
+
+    offset = max(0, args.offset)
+    shortlisted = all_shortlisted[offset:]
+
     if args.max_profiles > 0:
         shortlisted = shortlisted[:args.max_profiles]
-    print(f"Staff profiles shortlisted: {len(shortlisted)}")
+
+    print(
+        f"Total staff profiles shortlisted: "
+        f"{len(all_shortlisted)}"
+    )
+    print(
+        f"Processing slice: offset={offset}, "
+        f"count={len(shortlisted)}"
+    )
 
     prepared: dict[str, dict] = {}
     ambiguous: list[str] = []
     no_email: list[str] = []
+    failures: list[str] = []
 
     session = create_session()
     try:
         for index, entry in enumerate(shortlisted, start=1):
             try:
-                profile = fetch_staff_profile(session, entry)
+                profile = fetch_staff_profile_with_retry(
+                    session,
+                    entry,
+                    args.retries,
+                )
                 result = build_registry_document(profile, instructors)
                 if result is None:
                     ranked = best_instructor_matches(profile.get("fullName", ""), instructors)
@@ -285,7 +362,14 @@ def main() -> int:
                     f"[{payload.get('matchBasis', 'NAME')}{unit_note}]"
                 )
             except Exception as error:
-                print(f"WARN {entry.full_name}: {error}", file=sys.stderr)
+                failures.append(entry.full_name)
+                print(
+                    f"WARN {entry.full_name}: {error}",
+                    file=sys.stderr,
+                )
+            finally:
+                if args.delay > 0:
+                    time.sleep(args.delay)
     finally:
         session.close()
 
@@ -293,6 +377,12 @@ def main() -> int:
     print(f"Prepared institutional-email records: {len(prepared)}")
     print(f"Ambiguous/unmatched profiles: {len(ambiguous)}")
     print(f"Shortlisted profiles without @udom.ac.tz email: {len(no_email)}")
+    print(f"Profile fetch/process failures: {len(failures)}")
+
+    if failures:
+        print("\nFailed profiles:")
+        for item in failures[:20]:
+            print(f"  {item}")
 
     print("\nSample prepared records:")
     for email, payload in list(sorted(prepared.items()))[:20]:
@@ -310,6 +400,13 @@ def main() -> int:
     if not args.write:
         print("\nDRY RUN COMPLETE. Firestore was NOT modified.")
         return 0
+
+    if failures:
+        raise RuntimeError(
+            "Refusing Firestore write because "
+            f"{len(failures)} profile(s) failed to process. "
+            "Re-run this batch until the failure count is zero."
+        )
 
     if not prepared:
         raise RuntimeError("Refusing to write: no verified registry records were prepared")
