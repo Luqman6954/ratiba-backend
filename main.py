@@ -1552,7 +1552,44 @@ def _send_lecturer_otp_email(
     message = EmailMessage()
     message["Subject"] = "Ratiba lecturer verification code"
     message["From"] = from_email
-    message["To"] = email
+    delivery_email = email
+
+    test_destination = normalize_whitespace(
+        os.getenv("RATIBA_OTP_TEST_DESTINATION")
+    )
+
+    if test_destination:
+        allow_test_redirect = (
+            os.getenv(
+                "RATIBA_ALLOW_OTP_TEST_REDIRECT",
+                "false",
+            ).lower()
+            in {"1", "true", "yes"}
+        )
+
+        environment = (
+            os.getenv("RATIBA_ENV", "")
+            .strip()
+            .lower()
+        )
+
+        if not allow_test_redirect:
+            _authorization_error(
+                503,
+                "OTP_TEST_REDIRECT_NOT_ALLOWED",
+                "OTP test redirection is not enabled",
+            )
+
+        if environment in {"production", "prod"}:
+            _authorization_error(
+                503,
+                "OTP_TEST_REDIRECT_FORBIDDEN",
+                "OTP test redirection cannot run in production",
+            )
+
+        delivery_email = test_destination
+
+    message["To"] = delivery_email
 
     message.set_content(
         "Your Ratiba lecturer verification code is:\n\n"
