@@ -467,69 +467,240 @@ def download_timetable_html(
         session.close()
 
 
+COURSE_CODE_ONLY_PATTERN = re.compile(
+    r"^[A-Z]{1,10}\s+\d{2,4}[A-Z]?"
+    r"(?:\s*/\s*[A-Z]{1,10}\s+\d{2,4}[A-Z]?)*$",
+    re.IGNORECASE,
+)
+
+
+COURSE_PART_WITH_GROUP_PATTERN = re.compile(
+    r"^(?P<code>"
+    r"[A-Z]{1,10}\s+\d{2,4}[A-Z]?"
+    r"(?:\s*/\s*[A-Z]{1,10}\s+\d{2,4}[A-Z]?)*"
+    r")"
+    r"(?:\s+(?P<group>.+))?$",
+    re.IGNORECASE,
+)
+
+
+def normalize_course_code_text(
+        value: str,
+) -> str:
+
+    normalized = normalize_whitespace(
+        value
+    )
+
+    normalized = re.sub(
+        r"\s*/\s*",
+        " / ",
+        normalized,
+    )
+
+    return normalized.strip().upper()
+
+
+def is_course_code_text(
+        value: str,
+) -> bool:
+
+    candidate = normalize_course_code_text(
+        value
+    )
+
+    return bool(
+        candidate
+        and COURSE_CODE_ONLY_PATTERN.fullmatch(
+            candidate
+        )
+    )
+
+
 def extract_course_names(
-    soup: BeautifulSoup,
+        soup: BeautifulSoup,
 ):
+    """
+    Extract UDOM course-code -> course-name mappings.
+
+    The previous implementation depended on one exact
+    DESCRIPTION <span> structure and exactly three <td>
+    columns. UDOM pages are not always shaped that way.
+
+    This version:
+    - prefers the table following DESCRIPTION when present
+    - accepts DESCRIPTION in any element, not only <span>
+    - accepts td or th cells
+    - safely scans other tables as fallback
+    - only accepts cells that look exactly like course codes
+    """
+
     course_names = {}
 
-    description_span = soup.find(
-        "span",
+    candidate_tables = []
+
+    description_node = soup.find(
         string=lambda text: (
             text
             and "DESCRIPTION"
-            in text.upper()
-        ),
+            in normalize_whitespace(
+                text
+            ).upper()
+        )
     )
 
-    if description_span is None:
-        return course_names
+    if description_node is not None:
 
-    description_table = (
-        description_span.find_next(
+        parent = getattr(
+            description_node,
+            "parent",
+            None,
+        )
+
+        if parent is not None:
+
+            description_table = (
+                parent.find_next(
+                    "table"
+                )
+            )
+
+            if description_table is not None:
+                candidate_tables.append(
+                    description_table
+                )
+
+    for table in soup.find_all(
             "table"
-        )
-    )
-
-    if description_table is None:
-        return course_names
-
-    for row in description_table.find_all(
-        "tr"
     ):
-        columns = row.find_all("td")
 
-        if len(columns) < 3:
-            continue
-
-        course_code = normalize_whitespace(
-            columns[1].get_text(
-                " ",
-                strip=True,
+        if table not in candidate_tables:
+            candidate_tables.append(
+                table
             )
-        )
 
-        course_name = normalize_whitespace(
-            columns[2].get_text(
-                " ",
-                strip=True,
-            )
-        ).lstrip("-").strip()
+    ignored_values = {
+        "CODE",
+        "COURSE CODE",
+        "COURSE",
+        "DESCRIPTION",
+        "COURSE DESCRIPTION",
+        "COURSE NAME",
+        "COURSE TITLE",
+        "TITLE",
+        "NAME",
+    }
 
-        if course_code:
-            course_names[
-                course_code
-            ] = course_name
+    for table in candidate_tables:
+
+        for row in table.find_all(
+                "tr"
+        ):
+
+            cells = [
+                normalize_whitespace(
+                    cell.get_text(
+                        " ",
+                        strip=True,
+                    )
+                )
+                for cell in row.find_all(
+                    ["td", "th"]
+                )
+            ]
+
+            if len(cells) < 2:
+                continue
+
+            for index, raw_code in enumerate(
+                    cells
+            ):
+
+                course_code = (
+                    normalize_course_code_text(
+                        raw_code
+                    )
+                )
+
+                if not is_course_code_text(
+                        course_code
+                ):
+                    continue
+
+                course_name = ""
+
+                for raw_name in cells[
+                        index + 1:
+                ]:
+
+                    candidate_name = (
+                        normalize_whitespace(
+                            raw_name
+                        )
+                        .lstrip("-")
+                        .strip()
+                    )
+
+                    if not candidate_name:
+                        continue
+
+                    if (
+                            candidate_name.upper()
+                            in ignored_values
+                    ):
+                        continue
+
+                    if candidate_name.isdigit():
+                        continue
+
+                    if is_course_code_text(
+                            candidate_name
+                    ):
+                        continue
+
+                    course_name = (
+                        candidate_name
+                    )
+
+                    break
+
+                if course_name:
+
+                    course_names.setdefault(
+                        course_code,
+                        course_name,
+                    )
 
     return course_names
 
 
 def split_course_and_group(
-    course_part: str,
-    course_names: dict,
+        course_part: str,
+        course_names: dict,
 ):
+    """
+    Split strings such as:
+
+        AD 121 COED B
+          -> AD 121 / COED B
+
+        CP 123 / CP 1203 E
+          -> CP 123 / CP 1203 / E
+
+    Prefer UDOM's DESCRIPTION course map, but do not
+    depend on it. This preserves group information even
+    when the DESCRIPTION table is unavailable.
+    """
+
     normalized_course_part = (
         normalize_whitespace(
             course_part
+        )
+    )
+
+    normalized_upper = (
+        normalize_course_code_text(
+            normalized_course_part
         )
     )
 
@@ -540,18 +711,76 @@ def split_course_and_group(
     )
 
     for known_code in sorted_codes:
-        if normalized_course_part.startswith(
-            known_code
+
+        normalized_known_code = (
+            normalize_course_code_text(
+                known_code
+            )
+        )
+
+        if (
+                normalized_upper
+                == normalized_known_code
         ):
+            return (
+                known_code,
+                "",
+            )
+
+        prefix = (
+            normalized_known_code
+            + " "
+        )
+
+        if normalized_upper.startswith(
+                prefix
+        ):
+
             group = (
                 normalized_course_part[
                     len(known_code):
-                ].strip()
+                ]
+                .strip()
             )
 
-            return known_code, group
+            return (
+                known_code,
+                group,
+            )
 
-    return normalized_course_part, ""
+    generic_match = (
+        COURSE_PART_WITH_GROUP_PATTERN
+        .fullmatch(
+            normalized_course_part
+        )
+    )
+
+    if generic_match is not None:
+
+        course_code = (
+            normalize_course_code_text(
+                generic_match.group(
+                    "code"
+                )
+            )
+        )
+
+        group = normalize_whitespace(
+            generic_match.group(
+                "group"
+            )
+            or ""
+        )
+
+        return (
+            course_code,
+            group,
+        )
+
+    return (
+        normalized_course_part,
+        "",
+    )
 
 
 FIELD_LABEL_PATTERN = re.compile(
@@ -1837,6 +2066,9 @@ class PublishInstructorTimetableRequest(BaseModel):
     academicYear: str = ""
     semester: str = ""
 
+    offset: int = 0
+    batchSize: int = 10
+    forceRefresh: bool = False
 
 def clean_document_id_part(value: str) -> str:
     value = normalize_whitespace(value)
@@ -2592,6 +2824,977 @@ def write_official_instructor_sessions_to_firestore(
 
 
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# OFFICIAL UDOM COURSE CATALOGUE FALLBACK
+# ---------------------------------------------------------------------
+
+def parse_official_course_catalogue_label(
+        value: str,
+) -> tuple[str, str]:
+    label = normalize_whitespace(value)
+
+    if " - " not in label:
+        return "", ""
+
+    course_code, course_name = label.split(" - ", 1)
+
+    course_code = normalize_course_code_text(course_code)
+    course_name = normalize_whitespace(course_name)
+
+    course_name = re.sub(
+        r"\s+\([^()]+\)\s*$",
+        "",
+        course_name,
+    ).strip()
+
+    return course_code, course_name
+
+
+def get_official_course_catalogue(
+        year_id: str,
+        semester_id: str,
+        type_id: str,
+) -> dict:
+    cache_key = (
+        "official_course_catalogue",
+        year_id,
+        semester_id,
+        type_id,
+    )
+
+    cached = get_cached_reference(cache_key)
+    if cached is not None:
+        return cached
+
+    items = download_data(
+        year_id,
+        semester_id,
+        type_id,
+        "course",
+    )
+
+    catalogue_sets = {}
+
+    for item in items:
+        course_code, course_name = parse_official_course_catalogue_label(
+            item.get("name", "")
+        )
+
+        if not course_code or not course_name:
+            continue
+
+        catalogue_sets.setdefault(course_code, set()).add(course_name)
+
+    catalogue = {
+        course_code: sorted(names, key=str.lower)
+        for course_code, names in catalogue_sets.items()
+    }
+
+    if not catalogue:
+        raise RuntimeError("UDOM official course catalogue was empty")
+
+    save_cached_reference(cache_key, catalogue)
+    return catalogue
+
+
+def resolve_official_course_name(
+        course_code: str,
+        group: str,
+        catalogue: dict,
+) -> str:
+    base_code = normalize_course_code_text(course_code)
+    normalized_group = normalize_whitespace(group).upper()
+
+    candidates = []
+
+    if normalized_group:
+        tokens = normalized_group.split()
+
+        for count in range(len(tokens), 0, -1):
+            candidate = normalize_course_code_text(
+                base_code + " " + " ".join(tokens[:count])
+            )
+
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+    if base_code not in candidates:
+        candidates.append(base_code)
+
+    for candidate in candidates:
+        titles = catalogue.get(candidate) or []
+        normalized_titles = {}
+
+        for title in titles:
+            cleaned = normalize_whitespace(title)
+            if cleaned:
+                normalized_titles.setdefault(cleaned.lower(), cleaned)
+
+        if len(normalized_titles) == 1:
+            return next(iter(normalized_titles.values()))
+
+    return ""
+
+
+def enrich_session_course_name(
+        session: dict,
+        catalogue: dict,
+) -> dict:
+    enriched = dict(session)
+
+    existing = normalize_whitespace(
+        enriched.get("courseName", "")
+    )
+
+    if existing:
+        return enriched
+
+    resolved = resolve_official_course_name(
+        enriched.get("courseCode", ""),
+        enriched.get("group", ""),
+        catalogue,
+    )
+
+    if resolved:
+        enriched["courseName"] = resolved
+
+    return enriched
+
+
+# PROGRAMME-WIDE LECTURER SESSION DISCOVERY
+# ---------------------------------------------------------------------
+
+def normalize_lecturer_name(
+        value: str,
+) -> str:
+    """
+    Python equivalent of Android LecturerNameMatcher.normalize().
+    Keeping both sides identical prevents the backend and app from
+    disagreeing about which sessions belong to a lecturer.
+    """
+
+    if value is None:
+        return ""
+
+    normalized = unicodedata.normalize(
+        "NFD",
+        str(value),
+    )
+
+    normalized = "".join(
+        character
+        for character in normalized
+        if unicodedata.category(character)
+        != "Mn"
+    )
+
+    normalized = normalized.lower()
+
+    normalized = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        normalized,
+    ).strip()
+
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        normalized,
+    )
+
+    normalized = re.sub(
+        (
+            r"^(?:professor|prof|doctor|dr|"
+            r"mr|mrs|ms|miss|eng)\s+"
+        ),
+        "",
+        normalized,
+        count=1,
+    )
+
+    normalized = re.sub(
+        r"\s+(?:phd|msc|ma|mba|bsc)$",
+        "",
+        normalized,
+        count=1,
+    )
+
+    return normalized.strip()
+
+
+def split_lecturer_names(
+        value: str,
+) -> list[str]:
+    if value is None:
+        return []
+
+    value = str(value).strip()
+
+    if not value:
+        return []
+
+    parts = re.split(
+        r"\s*(?:,|;|\||/|\band\b|&)\s*",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+    names = [
+        part.strip()
+        for part in parts
+        if part is not None
+        and part.strip()
+    ]
+
+    return names or [value]
+
+
+def lecturer_last_token(
+        value: str,
+) -> str:
+    value = normalize_whitespace(
+        value
+    )
+
+    if not value:
+        return ""
+
+    return value.split()[-1]
+
+
+def count_common_lecturer_tokens(
+        first: str,
+        second: str,
+) -> int:
+    matches = 0
+
+    first_tokens = first.split()
+    second_tokens = second.split()
+
+    for first_token in first_tokens:
+        for second_token in second_tokens:
+            if first_token == second_token:
+                matches += 1
+                break
+
+    return matches
+
+
+def lecturer_name_matches(
+        session_lecturer_names: str,
+        profile_lecturer_name: str,
+) -> bool:
+    """
+    Exact backend port of LecturerNameMatcher.matches().
+    """
+
+    profile_name = normalize_lecturer_name(
+        profile_lecturer_name
+    )
+
+    if not profile_name:
+        return False
+
+    for candidate in split_lecturer_names(
+            session_lecturer_names
+    ):
+        normalized_candidate = (
+            normalize_lecturer_name(
+                candidate
+            )
+        )
+
+        if not normalized_candidate:
+            continue
+
+        if normalized_candidate == profile_name:
+            return True
+
+        profile_last_name = (
+            lecturer_last_token(
+                profile_name
+            )
+        )
+
+        candidate_last_name = (
+            lecturer_last_token(
+                normalized_candidate
+            )
+        )
+
+        if (
+                profile_last_name
+                and profile_last_name
+                == candidate_last_name
+        ):
+            profile_tokens = (
+                profile_name.split()
+            )
+
+            if len(profile_tokens) == 1:
+                return True
+
+            if (
+                    count_common_lecturer_tokens(
+                        profile_name,
+                        normalized_candidate,
+                    )
+                    >= 2
+            ):
+                return True
+
+    return False
+
+
+def download_programme_timetable_html_from_open_session(
+        session: requests.Session,
+        index_url: str,
+        csrf_token: str,
+        programme_id: str,
+        year_id: str,
+        semester_id: str,
+        type_id: str,
+) -> str:
+    """
+    Reuse one UDOM session for every programme in the current batch.
+    This avoids reloading the Ratiba index for each programme.
+    """
+
+    response = request_with_retries(
+        session,
+        f"{BASE_URL}/downloads/view",
+        params=[
+            ("_csrf-backend", csrf_token),
+            ("year", year_id),
+            ("semester", semester_id),
+            ("type", type_id),
+            ("option", "programme"),
+            ("data", programme_id),
+        ],
+        headers=dynamic_ajax_headers(
+            index_url,
+            csrf_token,
+        ),
+        attempts=2,
+        timeout=TIMETABLE_TIMEOUT,
+    )
+
+    if not response.text.strip():
+        raise RuntimeError(
+            "UDOM returned an empty timetable "
+            f"for programme {programme_id}."
+        )
+
+    return response.text
+
+
+def build_scanned_session_key(
+        request: PublishInstructorTimetableRequest,
+        session: dict,
+) -> str:
+    identity_request = (
+        build_instructor_session_identity_request(
+            request
+        )
+    )
+
+    return build_official_session_id(
+        identity_request,
+        session,
+    )
+
+
+def scan_programme_batch_for_lecturer(
+        request: PublishInstructorTimetableRequest,
+) -> dict:
+    programmes = download_programmes(
+        request.academicYearId,
+        request.semesterId,
+        request.categoryId,
+    )
+
+    course_catalogue = get_official_course_catalogue(
+        request.academicYearId,
+        request.semesterId,
+        request.categoryId,
+    )
+
+    total_programmes = len(
+        programmes
+    )
+
+    requested_offset = max(
+        0,
+        int(request.offset),
+    )
+
+    batch_size = max(
+        1,
+        min(
+            15,
+            int(request.batchSize),
+        ),
+    )
+
+    if requested_offset >= total_programmes:
+        return {
+            "programmes": programmes,
+            "totalProgrammes": total_programmes,
+            "offset": requested_offset,
+            "nextOffset": None,
+            "complete": True,
+            "processedProgrammeIds": [],
+            "failedProgrammes": [],
+            "matchedSessions": [],
+        }
+
+    batch_programmes = programmes[
+        requested_offset:
+        requested_offset + batch_size
+    ]
+
+    (
+        session,
+        index_url,
+        _,
+        csrf_token,
+    ) = open_dynamic_udom_session()
+
+    matched_sessions = []
+    failed_programmes = []
+    processed_programme_ids = []
+
+    try:
+        for programme in batch_programmes:
+            programme_id = clean_display_text(
+                programme.get(
+                    "programmeId"
+                )
+            )
+
+            programme_code = (
+                clean_display_text(
+                    programme.get(
+                        "programmeCode"
+                    )
+                )
+            )
+
+            programme_name = (
+                clean_display_text(
+                    programme.get(
+                        "programmeName"
+                    )
+                )
+            )
+
+            if not programme_id:
+                continue
+
+            processed_programme_ids.append(
+                programme_id
+            )
+
+            try:
+                html = (
+                    download_programme_timetable_html_from_open_session(
+                        session,
+                        index_url,
+                        csrf_token,
+                        programme_id,
+                        request.academicYearId,
+                        request.semesterId,
+                        request.categoryId,
+                    )
+                )
+
+                timetable = parse_timetable(
+                    html,
+                    programme_id,
+                )
+
+                for session_item in (
+                        timetable.get("sessions")
+                        or []
+                ):
+                    if not lecturer_name_matches(
+                            session_item.get(
+                                "lecturerName",
+                                "",
+                            ),
+                            request.instructorName,
+                    ):
+                        continue
+
+                    discovered_session = (
+                        enrich_session_course_name(
+                            session_item,
+                            course_catalogue,
+                        )
+                    )
+
+                    discovered_session[
+                        "_programmeId"
+                    ] = programme_id
+
+                    discovered_session[
+                        "_programmeCode"
+                    ] = programme_code
+
+                    discovered_session[
+                        "_programmeName"
+                    ] = programme_name
+
+                    matched_sessions.append(
+                        discovered_session
+                    )
+
+            except Exception as error:
+                failed_programmes.append(
+                    {
+                        "programmeId": (
+                            programme_id
+                        ),
+                        "programmeCode": (
+                            programme_code
+                        ),
+                        "error": str(error),
+                    }
+                )
+
+    finally:
+        session.close()
+
+    next_offset = (
+        requested_offset
+        + len(batch_programmes)
+    )
+
+    complete = (
+        next_offset
+        >= total_programmes
+    )
+
+    return {
+        "programmes": programmes,
+        "totalProgrammes": total_programmes,
+        "offset": requested_offset,
+        "nextOffset": (
+            None
+            if complete
+            else next_offset
+        ),
+        "complete": complete,
+        "processedProgrammeIds": (
+            processed_programme_ids
+        ),
+        "failedProgrammes": (
+            failed_programmes
+        ),
+        "matchedSessions": (
+            matched_sessions
+        ),
+    }
+
+
+def write_scanned_lecturer_sessions_to_firestore(
+        request: PublishInstructorTimetableRequest,
+        sessions: list[dict],
+) -> dict:
+    if firestore_db is None:
+        raise RuntimeError(
+            "Firebase is not configured"
+        )
+
+    if not sessions:
+        return {
+            "sessionCount": 0,
+            "sessionIds": [],
+        }
+
+    publication_id = (
+        build_instructor_publication_id(
+            request
+        )
+    )
+
+    aggregated_sessions = {}
+
+    for session in sessions:
+        session_id = (
+            build_scanned_session_key(
+                request,
+                session,
+            )
+        )
+
+        entry = aggregated_sessions.setdefault(
+            session_id,
+            {
+                "session": session,
+                "programmeIds": set(),
+                "programmeCodes": set(),
+                "programmeNames": set(),
+            },
+        )
+
+        programme_id = clean_display_text(
+            session.get(
+                "_programmeId"
+            )
+        )
+
+        programme_code = clean_display_text(
+            session.get(
+                "_programmeCode"
+            )
+        )
+
+        programme_name = clean_display_text(
+            session.get(
+                "_programmeName"
+            )
+        )
+
+        if programme_id:
+            entry["programmeIds"].add(
+                programme_id
+            )
+
+        if programme_code:
+            entry["programmeCodes"].add(
+                programme_code
+            )
+
+        if programme_name:
+            entry["programmeNames"].add(
+                programme_name
+            )
+
+    session_refs = {
+        session_id: (
+            firestore_db
+            .collection("timetables")
+            .document(session_id)
+        )
+        for session_id in aggregated_sessions
+    }
+
+    existing_ids = set()
+
+    for snapshot in firestore_db.get_all(
+            list(session_refs.values())
+    ):
+        if snapshot.exists:
+            existing_ids.add(
+                snapshot.id
+            )
+
+    batch = firestore_db.batch()
+
+    for session_id, entry in (
+            aggregated_sessions.items()
+    ):
+        session = entry["session"]
+
+        document = (
+            build_instructor_session_document(
+                request,
+                session,
+                session_id,
+                publication_id,
+                is_existing=(
+                    session_id in existing_ids
+                ),
+            )
+        )
+
+        programme_ids = sorted(
+            entry["programmeIds"]
+        )
+
+        programme_codes = sorted(
+            entry["programmeCodes"]
+        )
+
+        programme_names = sorted(
+            entry["programmeNames"]
+        )
+
+        if programme_ids:
+            document["programmeIds"] = (
+                firestore.ArrayUnion(
+                    programme_ids
+                )
+            )
+
+        if programme_codes:
+            document["programmeCodes"] = (
+                firestore.ArrayUnion(
+                    programme_codes
+                )
+            )
+
+        if programme_names:
+            document["programmeNames"] = (
+                firestore.ArrayUnion(
+                    programme_names
+                )
+            )
+
+        if (
+                session_id not in existing_ids
+                and programme_names
+        ):
+            document["course"] = (
+                programme_names[0]
+            )
+
+        if (
+                session_id not in existing_ids
+                and programme_codes
+        ):
+            study_year = extract_study_year(
+                programme_codes[0]
+            )
+
+            if study_year is not None:
+                document["year"] = (
+                    f"Year {study_year}"
+                )
+
+        batch.set(
+            session_refs[session_id],
+            document,
+            merge=True,
+        )
+
+    batch.commit()
+
+    return {
+        "sessionCount": len(
+            aggregated_sessions
+        ),
+        "sessionIds": sorted(
+            aggregated_sessions.keys()
+        ),
+    }
+
+
+def update_lecturer_programme_scan_publication(
+        request: PublishInstructorTimetableRequest,
+        scan_result: dict,
+        written_result: dict,
+) -> dict:
+    publication_id = (
+        build_instructor_publication_id(
+            request
+        )
+    )
+
+    publication_ref = (
+        firestore_db
+        .collection(
+            "instructorTimetablePublications"
+        )
+        .document(publication_id)
+    )
+
+    snapshot = publication_ref.get()
+
+    existing_data = (
+        snapshot.to_dict()
+        if snapshot.exists
+        else {}
+    ) or {}
+
+    if (
+            request.offset == 0
+            and request.forceRefresh
+    ):
+        existing_session_ids = set()
+        existing_failed_programmes = []
+    else:
+        existing_session_ids = set(
+            existing_data.get(
+                "sessionIds"
+            )
+            or []
+        )
+
+        existing_failed_programmes = list(
+            existing_data.get(
+                "failedProgrammes"
+            )
+            or []
+        )
+
+    existing_session_ids.update(
+        written_result.get(
+            "sessionIds"
+        )
+        or []
+    )
+
+    failed_by_id = {}
+
+    for failed in (
+            existing_failed_programmes
+            + scan_result.get(
+                "failedProgrammes",
+                [],
+            )
+    ):
+        programme_id = clean_display_text(
+            failed.get(
+                "programmeId"
+            )
+        )
+
+        if programme_id:
+            failed_by_id[
+                programme_id
+            ] = failed
+
+    complete = bool(
+        scan_result.get("complete")
+    )
+
+    if complete:
+        if failed_by_id:
+            status = "PARTIAL"
+        elif existing_session_ids:
+            status = "PUBLISHED"
+        else:
+            status = "EMPTY"
+    else:
+        status = "SCANNING"
+
+    processed_programmes = (
+        scan_result.get("nextOffset")
+    )
+
+    if processed_programmes is None:
+        processed_programmes = (
+            scan_result.get(
+                "totalProgrammes",
+                0,
+            )
+        )
+
+    publication_document = {
+        "publicationId": publication_id,
+
+        "instructorId": request.instructorId,
+        "instructorName": request.instructorName,
+
+        "academicYearId": (
+            request.academicYearId
+        ),
+        "academicYear": (
+            clean_display_text(
+                request.academicYear
+            )
+            or request.academicYearId
+        ),
+
+        "semesterId": request.semesterId,
+        "semester": (
+            clean_display_text(
+                request.semester
+            )
+            or request.semesterId
+        ),
+
+        "categoryId": request.categoryId,
+
+        "scanMode": "PROGRAMME_TIMETABLES",
+        "status": status,
+        "complete": complete,
+        "active": True,
+
+        "processedProgrammes": (
+            processed_programmes
+        ),
+        "totalProgrammes": (
+            scan_result.get(
+                "totalProgrammes",
+                0,
+            )
+        ),
+        "nextOffset": (
+            scan_result.get(
+                "nextOffset"
+            )
+        ),
+
+        "sessionCount": len(
+            existing_session_ids
+        ),
+        "sessionIds": sorted(
+            existing_session_ids
+        ),
+
+        "failedProgrammeCount": len(
+            failed_by_id
+        ),
+        "failedProgrammes": list(
+            failed_by_id.values()
+        ),
+
+        "source": "UDOM_RATIBA",
+        "updatedAt": (
+            firestore.SERVER_TIMESTAMP
+        ),
+    }
+
+    if request.offset == 0:
+        publication_document[
+            "startedAt"
+        ] = firestore.SERVER_TIMESTAMP
+
+    if complete:
+        publication_document[
+            "publishedAt"
+        ] = firestore.SERVER_TIMESTAMP
+
+    publication_ref.set(
+        publication_document,
+        merge=True,
+    )
+
+    return {
+        "publicationId": publication_id,
+        "status": status,
+        "complete": complete,
+        "processedProgrammes": (
+            processed_programmes
+        ),
+        "totalProgrammes": (
+            scan_result.get(
+                "totalProgrammes",
+                0,
+            )
+        ),
+        "nextOffset": (
+            scan_result.get(
+                "nextOffset"
+            )
+        ),
+        "sessionCount": len(
+            existing_session_ids
+        ),
+        "sessionIds": sorted(
+            existing_session_ids
+        ),
+        "failedProgrammeCount": len(
+            failed_by_id
+        ),
+    }
+
+
+# ---------------------------------------------------------------------
+
 # CACHE AND RELIABLE UDOM REQUESTS
 # ---------------------------------------------------------------------
 
@@ -4702,9 +5905,11 @@ def publish_instructor_timetable(
         request: PublishInstructorTimetableRequest,
 ):
     """
-    Fetch the selected lecturer's complete official UDOM timetable,
-    upsert it into Firestore, and make it available to the existing
-    Firestore-to-Room lecturer synchronization flow.
+    Discover a lecturer's official sessions by scanning programme
+    teaching timetables in small batches.
+
+    UDOM's instructor filter is intentionally not the source of truth
+    because many lecturer assignments appear only in programme pages.
     """
 
     if firestore_db is None:
@@ -4734,6 +5939,19 @@ def publish_instructor_timetable(
             detail="Instructor name is required",
         )
 
+    request.offset = max(
+        0,
+        int(request.offset),
+    )
+
+    request.batchSize = max(
+        1,
+        min(
+            15,
+            int(request.batchSize),
+        ),
+    )
+
     publication_id = (
         build_instructor_publication_id(
             request
@@ -4753,40 +5971,120 @@ def publish_instructor_timetable(
             publication_ref.get()
         )
 
-        html = (
-            download_instructor_timetable_html(
-                request.instructorId,
-                request.academicYearId,
-                request.semesterId,
-                request.categoryId,
+        existing_data = (
+            existing_publication.to_dict()
+            if existing_publication.exists
+            else {}
+        ) or {}
+
+        if (
+                request.offset == 0
+                and not request.forceRefresh
+                and existing_data.get(
+                    "scanMode"
+                )
+                == "PROGRAMME_TIMETABLES"
+                and existing_data.get(
+                    "complete"
+                )
+                is True
+        ):
+            return {
+                "success": True,
+                "alreadyPublished": True,
+                "complete": True,
+                "publicationId": publication_id,
+                "instructorId": (
+                    request.instructorId
+                ),
+                "instructorName": (
+                    request.instructorName
+                ),
+                "processedProgrammes": (
+                    existing_data.get(
+                        "processedProgrammes",
+                        0,
+                    )
+                ),
+                "totalProgrammes": (
+                    existing_data.get(
+                        "totalProgrammes",
+                        0,
+                    )
+                ),
+                "nextOffset": None,
+                "sessionCount": (
+                    existing_data.get(
+                        "sessionCount",
+                        0,
+                    )
+                ),
+                "failedProgrammeCount": (
+                    existing_data.get(
+                        "failedProgrammeCount",
+                        0,
+                    )
+                ),
+                "message": (
+                    "Official lecturer timetable "
+                    "is already indexed"
+                ),
+            }
+
+        scan_result = (
+            scan_programme_batch_for_lecturer(
+                request
             )
         )
 
-        timetable = parse_instructor_timetable(
-            html,
-            request.instructorId,
-        )
-
-        sessions = (
-            timetable.get("sessions")
-            or []
-        )
-
-        if not sessions:
-            raise HTTPException(
-                status_code=404,
-                detail=(
-                    "UDOM returned no sessions for "
-                    "the selected lecturer"
+        written_result = (
+            write_scanned_lecturer_sessions_to_firestore(
+                request,
+                scan_result.get(
+                    "matchedSessions",
+                    [],
                 ),
             )
+        )
 
         publication_result = (
-            write_official_instructor_sessions_to_firestore(
+            update_lecturer_programme_scan_publication(
                 request,
-                sessions,
+                scan_result,
+                written_result,
             )
         )
+
+        complete = bool(
+            publication_result.get(
+                "complete"
+            )
+        )
+
+        session_count = int(
+            publication_result.get(
+                "sessionCount",
+                0,
+            )
+        )
+
+        if complete and session_count == 0:
+            message = (
+                "No official sessions were found "
+                "for this lecturer after scanning "
+                "all programme timetables"
+            )
+
+        elif complete:
+            message = (
+                "Official lecturer timetable "
+                "was prepared from programme timetables"
+            )
+
+        else:
+            message = (
+                "Lecturer timetable scan is in progress"
+            )
 
         return {
             "success": True,
@@ -4799,9 +6097,19 @@ def publish_instructor_timetable(
             "instructorName": (
                 request.instructorName
             ),
-            "message": (
-                "Official lecturer timetable published"
+            "batchMatchedSessionCount": (
+                written_result.get(
+                    "sessionCount",
+                    0,
+                )
             ),
+            "batchFailedProgrammeCount": len(
+                scan_result.get(
+                    "failedProgrammes",
+                    [],
+                )
+            ),
+            "message": message,
             **publication_result,
         }
 
@@ -4813,7 +6121,7 @@ def publish_instructor_timetable(
             status_code=502,
             detail=(
                 "Could not contact UDOM Ratiba "
-                "while loading the lecturer timetable: "
+                "while scanning programme timetables: "
                 f"{error}"
             ),
         ) from error
@@ -4822,7 +6130,8 @@ def publish_instructor_timetable(
         raise HTTPException(
             status_code=500,
             detail=(
-                "Failed to publish lecturer timetable: "
+                "Failed to prepare lecturer timetable "
+                "from programme timetables: "
                 f"{error}"
             ),
         ) from error
