@@ -14,6 +14,12 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
+import hmac
+import secrets
+import smtplib
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+
 import firebase_admin
 from firebase_admin import auth as firebase_auth
 from firebase_admin import credentials, firestore
@@ -1286,14 +1292,19 @@ firestore_db = initialize_firestore()
 # PHASE 1B - AUTOMATIC LECTURER AUTHORIZATION
 # ---------------------------------------------------------------------
 
-class LecturerAutoProvisionRequest(BaseModel):
-    instructorId: str
-    academicYearId: str
-    semesterId: str
-    categoryId: str = "1"
+class LecturerVerificationRequest(BaseModel):
+    institutionalEmail: str
 
 
-LECTURER_REGISTRY_MIN_SCORE = 0.86
+class LecturerVerificationConfirmRequest(BaseModel):
+    institutionalEmail: str
+    code: str
+
+
+LECTURER_REGISTRY_MIN_SCORE = 0.94
+LECTURER_OTP_TTL_SECONDS = 600
+LECTURER_OTP_RESEND_SECONDS = 60
+LECTURER_OTP_MAX_ATTEMPTS = 5
 
 
 def _authorization_error(status_code: int, code: str, message: str):
@@ -1303,19 +1314,39 @@ def _authorization_error(status_code: int, code: str, message: str):
     )
 
 
-def require_verified_firebase_user(authorization: str | None) -> dict:
+def require_verified_firebase_user(
+        authorization: str | None,
+) -> dict:
+    """
+    Verify the Firebase ID token.
+
+    Important:
+    This verifies the Ratiba account identity only.
+    The user's Firebase login email does NOT have to be
+    their institutional UDOM email.
+    """
+
     if firestore_db is None:
         _authorization_error(
             503,
             "FIREBASE_NOT_CONFIGURED",
-            "Lecturer verification is unavailable because Firebase Admin is not configured",
+            "Authentication is unavailable because Firebase Admin is not configured",
         )
 
     if not authorization:
-        _authorization_error(401, "AUTH_REQUIRED", "A Firebase ID token is required")
+        _authorization_error(
+            401,
+            "AUTH_REQUIRED",
+            "A Firebase ID token is required",
+        )
 
     scheme, separator, token = authorization.partition(" ")
-    if separator != " " or scheme.lower() != "bearer" or not token.strip():
+
+    if (
+        separator != " "
+        or scheme.lower() != "bearer"
+        or not token.strip()
+    ):
         _authorization_error(
             401,
             "INVALID_AUTHORIZATION_HEADER",
@@ -1323,84 +1354,327 @@ def require_verified_firebase_user(authorization: str | None) -> dict:
         )
 
     try:
-        claims = firebase_auth.verify_id_token(token.strip(), check_revoked=True)
+        claims = firebase_auth.verify_id_token(
+            token.strip(),
+            check_revoked=True,
+        )
     except Exception:
-        _authorization_error(401, "INVALID_FIREBASE_TOKEN", "Firebase authentication failed")
+        _authorization_error(
+            401,
+            "INVALID_FIREBASE_TOKEN",
+            "Firebase authentication failed",
+        )
 
-    uid = normalize_whitespace(claims.get("uid") or claims.get("sub"))
+    uid = normalize_whitespace(
+        claims.get("uid") or claims.get("sub")
+    )
+
     if not uid:
-        _authorization_error(401, "MISSING_FIREBASE_UID", "Authenticated token has no UID")
+        _authorization_error(
+            401,
+            "MISSING_FIREBASE_UID",
+            "Authenticated token has no UID",
+        )
 
     claims["uid"] = uid
     return claims
 
 
-def normalize_institutional_email(value: str | None) -> str:
+def normalize_institutional_email(
+        value: str | None,
+) -> str:
     return normalize_whitespace(value).lower()
 
 
-def get_udom_staff_registry_record(email: str):
+def get_udom_staff_registry_record(
+        email: str,
+):
     snapshot = (
         firestore_db
         .collection("udom_staff_registry")
         .document(email)
         .get()
     )
+
     if not snapshot.exists:
         return None
+
     data = snapshot.to_dict() or {}
     data["_documentId"] = snapshot.id
     return data
 
 
-def find_official_instructor(
-        instructor_id: str,
-        academic_year_id: str,
-        semester_id: str,
-        category_id: str,
-):
-    instructor_id = normalize_whitespace(instructor_id)
-    if not instructor_id:
-        return None
+def require_eligible_lecturer_registry_record(
+        email: str,
+) -> dict:
 
-    cache_key = (
-        "instructors",
-        academic_year_id,
-        semester_id,
-        category_id,
+    email = normalize_institutional_email(email)
+
+    if (
+        not email
+        or not email.endswith("@udom.ac.tz")
+        or email.count("@") != 1
+    ):
+        _authorization_error(
+            400,
+            "INVALID_INSTITUTIONAL_EMAIL",
+            "Enter a valid institutional @udom.ac.tz email",
+        )
+
+    staff_record = get_udom_staff_registry_record(email)
+
+    if (
+        not staff_record
+        or staff_record.get("active") is False
+    ):
+        _authorization_error(
+            403,
+            "NOT_IN_UDOM_STAFF_REGISTRY",
+            "This institutional email is not currently eligible for automatic lecturer verification",
+        )
+
+    try:
+        score = float(
+            staff_record.get("matchScore") or 0.0
+        )
+    except (TypeError, ValueError):
+        score = 0.0
+
+    if score < LECTURER_REGISTRY_MIN_SCORE:
+        _authorization_error(
+            409,
+            "STAFF_MATCH_NEEDS_REVIEW",
+            "This lecturer identity requires manual review",
+        )
+
+    instructor_id = normalize_whitespace(
+        staff_record.get("instructorId")
     )
-    instructors = get_cached_reference(cache_key)
-    if instructors is None:
-        instructors = download_instructors(
-            academic_year_id,
-            semester_id,
-            category_id,
-        )
-        save_cached_reference(cache_key, instructors)
 
-    for instructor in instructors:
-        current_id = normalize_whitespace(
-            instructor.get("instructorId") or instructor.get("id")
+    instructor_name = normalize_whitespace(
+        staff_record.get("instructorName")
+    )
+
+    if not instructor_id or not instructor_name:
+        _authorization_error(
+            409,
+            "INCOMPLETE_LECTURER_REGISTRY_RECORD",
+            "The trusted staff record has no complete Ratiba instructor binding",
         )
-        if current_id == instructor_id:
-            return instructor
-    return None
+
+    return staff_record
+
+
+def _lecturer_otp_secret() -> str:
+    value = os.getenv("LECTURER_OTP_SECRET")
+
+    if not value:
+        _authorization_error(
+            503,
+            "LECTURER_OTP_NOT_CONFIGURED",
+            "Lecturer OTP verification is not configured",
+        )
+
+    return value
+
+
+def _lecturer_otp_digest(
+        uid: str,
+        email: str,
+        code: str,
+) -> str:
+
+    secret = _lecturer_otp_secret().encode("utf-8")
+
+    message = (
+        f"{uid}|{email}|{code}"
+    ).encode("utf-8")
+
+    return hmac.new(
+        secret,
+        message,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _send_lecturer_otp_email(
+        email: str,
+        code: str,
+):
+    """
+    Send OTP through generic SMTP configuration.
+
+    Required environment variables:
+      RATIBA_SMTP_HOST
+      RATIBA_SMTP_PORT
+      RATIBA_SMTP_FROM_EMAIL
+
+    Optional authentication:
+      RATIBA_SMTP_USERNAME
+      RATIBA_SMTP_PASSWORD
+    """
+
+    host = normalize_whitespace(
+        os.getenv("RATIBA_SMTP_HOST")
+    )
+
+    from_email = normalize_whitespace(
+        os.getenv("RATIBA_SMTP_FROM_EMAIL")
+    )
+
+    username = normalize_whitespace(
+        os.getenv("RATIBA_SMTP_USERNAME")
+    )
+
+    password = os.getenv("RATIBA_SMTP_PASSWORD") or ""
+
+    try:
+        port = int(
+            os.getenv("RATIBA_SMTP_PORT") or "587"
+        )
+    except ValueError:
+        port = 587
+
+    if not host or not from_email:
+        _authorization_error(
+            503,
+            "SMTP_NOT_CONFIGURED",
+            "Lecturer verification email service is not configured",
+        )
+
+    if username and not password:
+        _authorization_error(
+            503,
+            "SMTP_PASSWORD_MISSING",
+            "Lecturer verification email service is incomplete",
+        )
+
+    message = EmailMessage()
+    message["Subject"] = "Ratiba lecturer verification code"
+    message["From"] = from_email
+    message["To"] = email
+
+    message.set_content(
+        "Your Ratiba lecturer verification code is:\n\n"
+        f"{code}\n\n"
+        "This code expires in 10 minutes.\n"
+        "If you did not request this code, ignore this email."
+    )
+
+    use_starttls = (
+        os.getenv(
+            "RATIBA_SMTP_STARTTLS",
+            "true",
+        ).lower()
+        not in {"0", "false", "no"}
+    )
+
+    with smtplib.SMTP(
+        host,
+        port,
+        timeout=20,
+    ) as smtp:
+
+        if use_starttls:
+            smtp.starttls()
+
+        if username:
+            smtp.login(
+                username,
+                password,
+            )
+
+        smtp.send_message(message)
+
+
+def _ensure_email_not_bound_to_another_user(
+        uid: str,
+        email: str,
+):
+    owner_ref = (
+        firestore_db
+        .collection("lecturer_email_bindings")
+        .document(email)
+    )
+
+    snapshot = owner_ref.get()
+
+    if snapshot.exists:
+        data = snapshot.to_dict() or {}
+
+        existing_uid = normalize_whitespace(
+            data.get("uid")
+        )
+
+        if (
+            existing_uid
+            and existing_uid != uid
+            and data.get("active") is not False
+        ):
+            _authorization_error(
+                409,
+                "INSTITUTIONAL_EMAIL_ALREADY_BOUND",
+                "This institutional email is already linked to another Ratiba account",
+            )
 
 
 def grant_lecturer_role(
-        *, uid: str, email: str, staff_record: dict,
-        instructor: dict, request: LecturerAutoProvisionRequest,
+        *,
+        uid: str,
+        email: str,
+        staff_record: dict,
 ) -> dict:
-    instructor_id = normalize_whitespace(
-        instructor.get("instructorId") or instructor.get("id")
-    )
-    instructor_name = normalize_whitespace(
-        instructor.get("instructorName") or instructor.get("name")
-    )
-    staff_name = normalize_whitespace(staff_record.get("fullName"))
+    """
+    Create the trusted UID -> lecturer identity binding.
 
-    binding_ref = firestore_db.collection("lecturer_bindings").document(uid)
+    The instructor identity comes ONLY from
+    udom_staff_registry, never from client input.
+    """
+
+    email = normalize_institutional_email(email)
+
+    instructor_id = normalize_whitespace(
+        staff_record.get("instructorId")
+    )
+
+    instructor_name = normalize_whitespace(
+        staff_record.get("instructorName")
+    )
+
+    staff_name = normalize_whitespace(
+        staff_record.get("fullName")
+    )
+
+    _ensure_email_not_bound_to_another_user(
+        uid,
+        email,
+    )
+
+    binding_ref = (
+        firestore_db
+        .collection("lecturer_bindings")
+        .document(uid)
+    )
+
     existing = binding_ref.get()
+
+    if existing.exists:
+        old = existing.to_dict() or {}
+
+        old_email = normalize_institutional_email(
+            old.get("institutionalEmail")
+        )
+
+        if (
+            old.get("active") is True
+            and old_email
+            and old_email != email
+        ):
+            _authorization_error(
+                409,
+                "ACCOUNT_ALREADY_BOUND_TO_LECTURER",
+                "This Ratiba account is already linked to another lecturer identity",
+            )
 
     binding = {
         "uid": uid,
@@ -1411,38 +1685,77 @@ def grant_lecturer_role(
         "instructorId": instructor_id,
         "instructorName": instructor_name,
         "staffDirectoryName": staff_name,
-        "staffProfileUrl": normalize_whitespace(staff_record.get("profileUrl")),
-        "academicYearId": request.academicYearId,
-        "semesterId": request.semesterId,
-        "categoryId": request.categoryId,
+        "staffProfileUrl": normalize_whitespace(
+            staff_record.get("profileUrl")
+        ),
+        "matchScore": float(
+            staff_record.get("matchScore") or 0.0
+        ),
+        "matchBasis": normalize_whitespace(
+            staff_record.get("matchBasis")
+        ),
         "verificationMethod": (
-            "FIREBASE_VERIFIED_UDOM_EMAIL+"
-            "UDOM_PUBLIC_STAFF_DIRECTORY+"
-            "UDOM_RATIBA_INSTRUCTOR_MATCH"
+            "INSTITUTIONAL_EMAIL_OTP+"
+            "TRUSTED_UDOM_STAFF_REGISTRY"
         ),
         "updatedAt": firestore.SERVER_TIMESTAMP,
     }
-    if not existing.exists:
-        binding["createdAt"] = firestore.SERVER_TIMESTAMP
-    binding_ref.set(binding, merge=True)
 
-    # Server-controlled custom claims are the trusted coarse role identity.
+    if not existing.exists:
+        binding["createdAt"] = (
+            firestore.SERVER_TIMESTAMP
+        )
+
+    # Server-owned lecturer binding.
+    binding_ref.set(
+        binding,
+        merge=True,
+    )
+
+    # One institutional email -> one Firebase UID.
+    firestore_db.collection(
+        "lecturer_email_bindings"
+    ).document(email).set(
+        {
+            "uid": uid,
+            "institutionalEmail": email,
+            "instructorId": instructor_id,
+            "active": True,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        },
+        merge=True,
+    )
+
+    # Trusted coarse authorization claims.
     user_record = firebase_auth.get_user(uid)
-    claims = dict(user_record.custom_claims or {})
+
+    claims = dict(
+        user_record.custom_claims or {}
+    )
+
     claims["ratibaRole"] = "LECTURER"
     claims["ratibaInstructorId"] = instructor_id
-    firebase_auth.set_custom_user_claims(uid, claims)
 
-    # Keep the current Android profile compatible, but Firestore rules must
-    # NOT use users/{uid}.role as the authorization source.
-    firestore_db.collection("users").document(uid).set(
+    firebase_auth.set_custom_user_claims(
+        uid,
+        claims,
+    )
+
+    # Compatibility/profile fields only.
+    # IMPORTANT:
+    # Do NOT overwrite the user's normal login email.
+    firestore_db.collection(
+        "users"
+    ).document(uid).set(
         {
             "role": "LECTURER",
-            "email": email,
+            "institutionalEmail": email,
             "ratibaInstructorId": instructor_id,
             "verificationStatus": "VERIFIED_UDOM_STAFF",
             "accountStatus": "Active",
-            "updatedAtMillis": int(time.time() * 1000),
+            "updatedAtMillis": int(
+                time.time() * 1000
+            ),
         },
         merge=True,
     )
@@ -1457,7 +1770,6 @@ def grant_lecturer_role(
         "staffDirectoryName": staff_name,
         "refreshFirebaseToken": True,
     }
-
 
 
 class PublishTimetableRequest(BaseModel):
@@ -3441,114 +3753,387 @@ def get_instructors(
 
 
 
-@app.post("/auth/lecturer/auto-provision")
-def auto_provision_lecturer(
-        request: LecturerAutoProvisionRequest,
+@app.post("/auth/lecturer/verification/request")
+def request_lecturer_verification(
+        request: LecturerVerificationRequest,
         authorization: str | None = Header(default=None),
 ):
-    """Grant Lecturer only after trusted institutional checks pass."""
+    """
+    Step 1:
+    Verify that the institutional email belongs to a trusted
+    registry lecturer, then send a short-lived OTP.
+    """
 
-    from udom_staff_registry import name_match_score
+    claims = require_verified_firebase_user(
+        authorization
+    )
 
-    claims = require_verified_firebase_user(authorization)
     uid = claims["uid"]
-    email = normalize_institutional_email(claims.get("email"))
 
-    if not email.endswith("@udom.ac.tz"):
-        _authorization_error(
-            403,
-            "UDOM_EMAIL_REQUIRED",
-            "Lecturer accounts must use an institutional @udom.ac.tz Firebase email",
+    email = normalize_institutional_email(
+        request.institutionalEmail
+    )
+
+    staff_record = (
+        require_eligible_lecturer_registry_record(
+            email
+        )
+    )
+
+    _ensure_email_not_bound_to_another_user(
+        uid,
+        email,
+    )
+
+    binding_snapshot = (
+        firestore_db
+        .collection("lecturer_bindings")
+        .document(uid)
+        .get()
+    )
+
+    if binding_snapshot.exists:
+        binding = (
+            binding_snapshot.to_dict() or {}
         )
 
-    if claims.get("email_verified") is not True:
-        _authorization_error(
-            403,
-            "EMAIL_NOT_VERIFIED",
-            "Verify the institutional email in Firebase before lecturer setup",
+        if (
+            binding.get("active") is True
+            and binding.get("verified") is True
+        ):
+            current_email = (
+                normalize_institutional_email(
+                    binding.get(
+                        "institutionalEmail"
+                    )
+                )
+            )
+
+            if current_email == email:
+                return {
+                    "success": True,
+                    "alreadyVerified": True,
+                    "message": (
+                        "This lecturer identity is already verified"
+                    ),
+                    "binding": binding,
+                }
+
+            _authorization_error(
+                409,
+                "ACCOUNT_ALREADY_BOUND_TO_LECTURER",
+                "This Ratiba account is already linked to another lecturer identity",
+            )
+
+    challenge_ref = (
+        firestore_db
+        .collection("lecturer_otp_challenges")
+        .document(uid)
+    )
+
+    old_snapshot = challenge_ref.get()
+
+    now = datetime.now(timezone.utc)
+
+    if old_snapshot.exists:
+        old = old_snapshot.to_dict() or {}
+
+        resend_after = old.get(
+            "resendAfter"
         )
 
-    staff_record = get_udom_staff_registry_record(email)
-    if not staff_record or staff_record.get("active") is False:
-        _authorization_error(
-            403,
-            "NOT_IN_UDOM_STAFF_REGISTRY",
-            "The verified institutional email was not found in the synchronized UDOM staff registry",
-        )
+        if isinstance(
+            resend_after,
+            datetime,
+        ):
+            if resend_after.tzinfo is None:
+                resend_after = resend_after.replace(
+                    tzinfo=timezone.utc
+                )
 
-    registry_score = float(staff_record.get("matchScore") or 0.0)
-    if registry_score < LECTURER_REGISTRY_MIN_SCORE:
-        _authorization_error(
-            409,
-            "STAFF_MATCH_NEEDS_REVIEW",
-            "The staff-directory record is not strong enough for automatic role assignment",
+            if now < resend_after:
+                wait_seconds = max(
+                    1,
+                    int(
+                        (
+                            resend_after - now
+                        ).total_seconds()
+                    ),
+                )
+
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "code": "OTP_RESEND_TOO_SOON",
+                        "message": (
+                            "Please wait before requesting another verification code"
+                        ),
+                        "retryAfterSeconds": wait_seconds,
+                    },
+                )
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+
+    digest = _lecturer_otp_digest(
+        uid,
+        email,
+        code,
+    )
+
+    expires_at = (
+        now
+        + timedelta(
+            seconds=LECTURER_OTP_TTL_SECONDS
         )
+    )
+
+    resend_after = (
+        now
+        + timedelta(
+            seconds=LECTURER_OTP_RESEND_SECONDS
+        )
+    )
+
+    challenge_ref.set(
+        {
+            "uid": uid,
+            "institutionalEmail": email,
+            "codeHash": digest,
+            "attemptsRemaining": (
+                LECTURER_OTP_MAX_ATTEMPTS
+            ),
+            "expiresAt": expires_at,
+            "resendAfter": resend_after,
+            "createdAt": (
+                firestore.SERVER_TIMESTAMP
+            ),
+        }
+    )
 
     try:
-        instructor = find_official_instructor(
-            request.instructorId,
-            request.academicYearId,
-            request.semesterId,
-            request.categoryId,
+        _send_lecturer_otp_email(
+            email,
+            code,
         )
-    except requests.RequestException as error:
+
+    except HTTPException:
+        challenge_ref.delete()
+        raise
+
+    except Exception as error:
+        challenge_ref.delete()
+
         raise HTTPException(
             status_code=502,
             detail={
-                "code": "UDOM_RATIBA_UNAVAILABLE",
-                "message": f"Could not verify the official instructor list: {error}",
+                "code": "OTP_DELIVERY_FAILED",
+                "message": (
+                    "The lecturer verification email could not be sent"
+                ),
             },
         ) from error
 
-    if instructor is None:
+    return {
+        "success": True,
+        "alreadyVerified": False,
+        "message": (
+            "Verification code sent to the institutional email"
+        ),
+        "expiresInSeconds": (
+            LECTURER_OTP_TTL_SECONDS
+        ),
+        "instructorName": normalize_whitespace(
+            staff_record.get("instructorName")
+        ),
+    }
+
+
+@app.post("/auth/lecturer/verification/confirm")
+def confirm_lecturer_verification(
+        request: LecturerVerificationConfirmRequest,
+        authorization: str | None = Header(default=None),
+):
+    """
+    Step 2:
+    Prove ownership of the institutional mailbox and create
+    the trusted lecturer binding.
+    """
+
+    claims = require_verified_firebase_user(
+        authorization
+    )
+
+    uid = claims["uid"]
+
+    email = normalize_institutional_email(
+        request.institutionalEmail
+    )
+
+    staff_record = (
+        require_eligible_lecturer_registry_record(
+            email
+        )
+    )
+
+    code = normalize_whitespace(
+        request.code
+    )
+
+    if (
+        len(code) != 6
+        or not code.isdigit()
+    ):
         _authorization_error(
-            404,
-            "INSTRUCTOR_NOT_FOUND",
-            "The selected instructor is not in the official Ratiba instructor list for this academic scope",
+            400,
+            "INVALID_OTP_FORMAT",
+            "Enter the 6-digit verification code",
         )
 
-    official_instructor_id = normalize_whitespace(
-        instructor.get("instructorId") or instructor.get("id")
+    challenge_ref = (
+        firestore_db
+        .collection("lecturer_otp_challenges")
+        .document(uid)
     )
-    registry_instructor_id = normalize_whitespace(staff_record.get("instructorId"))
-    if registry_instructor_id and registry_instructor_id != official_instructor_id:
+
+    snapshot = challenge_ref.get()
+
+    if not snapshot.exists:
         _authorization_error(
-            409,
-            "INSTRUCTOR_BINDING_MISMATCH",
-            "The verified staff email is linked to a different official Ratiba instructor",
+            400,
+            "OTP_CHALLENGE_NOT_FOUND",
+            "Request a new lecturer verification code",
         )
 
-    instructor_name = normalize_whitespace(
-        instructor.get("instructorName") or instructor.get("name")
+    challenge = snapshot.to_dict() or {}
+
+    challenge_email = (
+        normalize_institutional_email(
+            challenge.get(
+                "institutionalEmail"
+            )
+        )
     )
-    staff_name = normalize_whitespace(staff_record.get("fullName"))
-    live_score = name_match_score(staff_name, instructor_name)
-    if live_score < 0.86:
+
+    if challenge_email != email:
+        _authorization_error(
+            400,
+            "OTP_EMAIL_MISMATCH",
+            "This verification code belongs to a different institutional email",
+        )
+
+    expires_at = challenge.get(
+        "expiresAt"
+    )
+
+    now = datetime.now(timezone.utc)
+
+    if not isinstance(
+        expires_at,
+        datetime,
+    ):
+        challenge_ref.delete()
+
+        _authorization_error(
+            400,
+            "OTP_CHALLENGE_INVALID",
+            "Request a new lecturer verification code",
+        )
+
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(
+            tzinfo=timezone.utc
+        )
+
+    if now > expires_at:
+        challenge_ref.delete()
+
+        _authorization_error(
+            400,
+            "OTP_EXPIRED",
+            "The verification code has expired",
+        )
+
+    attempts = int(
+        challenge.get(
+            "attemptsRemaining"
+        )
+        or 0
+    )
+
+    if attempts <= 0:
+        _authorization_error(
+            429,
+            "OTP_ATTEMPTS_EXHAUSTED",
+            "Too many incorrect verification attempts. Request a new code.",
+        )
+
+    expected = normalize_whitespace(
+        challenge.get("codeHash")
+    )
+
+    actual = _lecturer_otp_digest(
+        uid,
+        email,
+        code,
+    )
+
+    if not hmac.compare_digest(
+        expected,
+        actual,
+    ):
+        remaining = max(
+            0,
+            attempts - 1,
+        )
+
+        challenge_ref.update(
+            {
+                "attemptsRemaining": remaining
+            }
+        )
+
         raise HTTPException(
-            status_code=409,
+            status_code=400,
             detail={
-                "code": "LECTURER_IDENTITY_NEEDS_REVIEW",
+                "code": "INVALID_OTP",
                 "message": (
-                    "Institutional email is verified, but the UDOM staff name "
-                    "does not safely match the selected Ratiba instructor"
+                    "The verification code is incorrect"
                 ),
-                "staffDirectoryName": staff_name,
-                "instructorName": instructor_name,
-                "matchScore": live_score,
+                "attemptsRemaining": remaining,
             },
         )
 
+    binding = grant_lecturer_role(
+        uid=uid,
+        email=email,
+        staff_record=staff_record,
+    )
+
+    challenge_ref.delete()
+
     return {
         "success": True,
-        "message": "Lecturer identity verified and role granted automatically",
-        "binding": grant_lecturer_role(
-            uid=uid,
-            email=email,
-            staff_record=staff_record,
-            instructor=instructor,
-            request=request,
+        "message": (
+            "Lecturer identity verified successfully"
         ),
+        "binding": binding,
     }
+
+
+@app.post("/auth/lecturer/auto-provision")
+def deprecated_auto_provision_lecturer():
+    """
+    Old Phase 1B route intentionally disabled.
+    """
+
+    _authorization_error(
+        410,
+        "OLD_LECTURER_FLOW_DISABLED",
+        (
+            "Use institutional email verification instead of "
+            "selecting an instructor manually"
+        ),
+    )
 
 
 @app.get("/auth/me")
