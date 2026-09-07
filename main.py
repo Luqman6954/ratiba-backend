@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 import time
 from threading import Lock
 from time import monotonic
@@ -2976,9 +2977,27 @@ def normalize_lecturer_name(
     if value is None:
         return ""
 
+    raw_value = str(value).strip()
+
+    # UDOM instructor selector / staff registry may append
+    # the academic unit to the person's display name:
+    #
+    #   Mr. Daniel Susuma (CHSS)
+    #
+    # Programme timetable sessions normally contain:
+    #
+    #   Mr. Daniel Susuma
+    #
+    # The unit is metadata, not part of the lecturer's name.
+    raw_value = re.sub(
+        r"\s*\([^()]+\)\s*$",
+        "",
+        raw_value,
+    ).strip()
+
     normalized = unicodedata.normalize(
         "NFD",
-        str(value),
+        raw_value,
     )
 
     normalized = "".join(
@@ -3211,6 +3230,25 @@ def scan_programme_batch_for_lecturer(
         request.academicYearId,
         request.semesterId,
         request.categoryId,
+    )
+
+    # UDOM does not guarantee programme option ordering.
+    # Every scanner batch performs a fresh request, so raw
+    # offset pagination is unsafe unless we impose a stable
+    # order before slicing.
+    programmes = sorted(
+        programmes,
+        key=lambda item: (
+            clean_display_text(
+                item.get("programmeId")
+            ),
+            clean_display_text(
+                item.get("programmeCode")
+            ).upper(),
+            clean_display_text(
+                item.get("programmeName")
+            ).upper(),
+        ),
     )
 
     course_catalogue = get_official_course_catalogue(
