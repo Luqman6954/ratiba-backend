@@ -5437,7 +5437,49 @@ def get_my_authorization(
     cr_snapshot = firestore_db.collection("cr_assignments").document(uid).get()
     if cr_snapshot.exists:
         assignment = cr_snapshot.to_dict() or {}
-        if assignment.get("active") is True:
+
+        required_scope_fields = (
+            "uid",
+            "course",
+            "courseKey",
+            "year",
+            "semester",
+            "academicYearId",
+            "semesterId",
+        )
+
+        scope_complete = all(
+            str(assignment.get(field) or "").strip()
+            for field in required_scope_fields
+        )
+
+        course = str(
+            assignment.get("course") or ""
+        ).strip()
+
+        expected_course_key = (
+            course
+            .replace(" ", "")
+            .upper()
+        )
+
+        assignment_course_key = str(
+            assignment.get("courseKey") or ""
+        ).strip().replace(" ", "").upper()
+
+        assignment_is_valid = (
+            assignment.get("active") is True
+            and str(
+                assignment.get("role") or ""
+            ).strip().upper() == "CR"
+            and str(
+                assignment.get("uid") or ""
+            ).strip() == uid
+            and scope_complete
+            and assignment_course_key == expected_course_key
+        )
+
+        if assignment_is_valid:
             return {
                 "uid": uid,
                 "role": "CR",
