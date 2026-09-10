@@ -3806,6 +3806,165 @@ def update_lecturer_programme_scan_publication(
     else:
         status = "SCANNING"
 
+    # ---------------------------------------------------------
+    # REVOKE STALE LECTURER PROGRAMME ACCESS
+    #
+    # Only do this after a fully successful programme scan.
+    # A partial/failed scan must never revoke previously valid
+    # access because some programmes may simply not have been
+    # checked successfully.
+    #
+    # existing_session_ids represents the full accumulated scan
+    # because it is reset at offset 0 on a forced fresh scan and
+    # then accumulated across subsequent pages.
+    # ---------------------------------------------------------
+
+    if complete and not failed_by_id:
+        instructor_id = str(
+            request.instructorId
+        ).strip()
+
+        current_course_keys = set()
+
+        session_refs = [
+            firestore_db
+            .collection("timetables")
+            .document(session_id)
+            for session_id in sorted(
+                existing_session_ids
+            )
+        ]
+
+        # Lecturer timetables are normally small, but chunk the
+        # reads so this remains safe if the number grows.
+        for start in range(
+                0,
+                len(session_refs),
+                400
+        ):
+            snapshots = firestore_db.get_all(
+                session_refs[
+                    start:start + 400
+                ]
+            )
+
+            for session_snapshot in snapshots:
+                if not session_snapshot.exists:
+                    continue
+
+                session_data = (
+                    session_snapshot.to_dict()
+                    or {}
+                )
+
+                programme_codes = (
+                    session_data.get(
+                        "programmeCodes"
+                    )
+                    or []
+                )
+
+                for programme_code in (
+                        programme_codes
+                ):
+                    normalized_code = (
+                        clean_display_text(
+                            programme_code
+                        )
+                    )
+
+                    course_key = re.sub(
+                        r"\s+",
+                        "",
+                        normalized_code,
+                    ).upper()
+
+                    if course_key:
+                        current_course_keys.add(
+                            course_key
+                        )
+
+        assignments_ref = (
+            firestore_db
+            .collection(
+                "lecturer_course_assignments"
+            )
+            .document(instructor_id)
+            .collection("programmes")
+        )
+
+        stale_assignments = []
+
+        for assignment_snapshot in (
+                assignments_ref.stream()
+        ):
+            assignment_data = (
+                assignment_snapshot.to_dict()
+                or {}
+            )
+
+            # Only the trusted UDOM-derived assignment namespace
+            # participates in automatic revocation.
+            if (
+                assignment_data.get(
+                    "authorizationSource"
+                )
+                != "UDOM_RATIBA"
+            ):
+                continue
+
+            if (
+                assignment_snapshot.id
+                not in current_course_keys
+            ):
+                stale_assignments.append(
+                    assignment_snapshot.reference
+                )
+
+        # Firestore batches allow hundreds of writes. Chunking
+        # keeps this safe even if assignment count grows.
+        for start in range(
+                0,
+                len(stale_assignments),
+                400
+        ):
+            revoke_batch = (
+                firestore_db.batch()
+            )
+
+            for assignment_ref in (
+                stale_assignments[
+                    start:start + 400
+                ]
+            ):
+                revoke_batch.set(
+                    assignment_ref,
+                    {
+                        "active": False,
+                        "deactivatedAt":
+                            firestore.SERVER_TIMESTAMP,
+                        "updatedAt":
+                            firestore.SERVER_TIMESTAMP,
+                        "deactivationReason":
+                            "NOT_IN_LATEST_COMPLETE_SCAN",
+                        "lastCheckedAcademicYearId":
+                            str(
+                                request.academicYearId
+                            ).strip(),
+                        "lastCheckedSemesterId":
+                            str(
+                                request.semesterId
+                            ).strip(),
+                        "lastCheckedCategoryId":
+                            str(
+                                request.categoryId
+                            ).strip(),
+                    },
+                    merge=True,
+                )
+
+            revoke_batch.commit()
+
     processed_programmes = (
         scan_result.get("nextOffset")
     )
