@@ -3529,6 +3529,7 @@ def write_scanned_lecturer_sessions_to_firestore(
             )
 
     batch = firestore_db.batch()
+    assignment_programme_codes = set()
 
     for session_id, entry in (
             aggregated_sessions.items()
@@ -3567,6 +3568,10 @@ def write_scanned_lecturer_sessions_to_firestore(
             )
 
         if programme_codes:
+            assignment_programme_codes.update(
+                programme_codes
+            )
+
             document["programmeCodes"] = (
                 firestore.ArrayUnion(
                     programme_codes
@@ -3604,6 +3609,99 @@ def write_scanned_lecturer_sessions_to_firestore(
         batch.set(
             session_refs[session_id],
             document,
+            merge=True,
+        )
+
+    # ---------------------------------------------------------
+    # TRUSTED LECTURER -> PROGRAMME AUTHORIZATION
+    #
+    # These documents are derived only from the official UDOM
+    # timetable scan. Android clients never create or modify them.
+    # ---------------------------------------------------------
+
+    instructor_id = str(
+        request.instructorId
+    ).strip()
+
+    for programme_code in sorted(
+            assignment_programme_codes
+    ):
+        programme_code = clean_display_text(
+            programme_code
+        )
+
+        course_key = re.sub(
+            r"\s+",
+            "",
+            programme_code,
+        ).upper()
+
+        if not course_key:
+            continue
+
+        assignment_ref = (
+            firestore_db
+            .collection(
+                "lecturer_course_assignments"
+            )
+            .document(instructor_id)
+            .collection("programmes")
+            .document(course_key)
+        )
+
+        assignment_document = {
+            "instructorId": instructor_id,
+            "instructorName": clean_display_text(
+                request.instructorName
+            ),
+
+            "programmeCode": programme_code,
+            "courseKey": course_key,
+
+            "academicYearId": str(
+                request.academicYearId
+            ).strip(),
+
+            "academicYear": (
+                clean_display_text(
+                    request.academicYear
+                )
+                or str(
+                    request.academicYearId
+                ).strip()
+            ),
+
+            "semesterId": str(
+                request.semesterId
+            ).strip(),
+
+            "semester": (
+                clean_display_text(
+                    request.semester
+                )
+                or str(
+                    request.semesterId
+                ).strip()
+            ),
+
+            "categoryId": str(
+                request.categoryId
+            ).strip(),
+
+            "active": True,
+            "authorizationSource":
+                "UDOM_RATIBA",
+
+            "publicationId":
+                publication_id,
+
+            "updatedAt":
+                firestore.SERVER_TIMESTAMP,
+        }
+
+        batch.set(
+            assignment_ref,
+            assignment_document,
             merge=True,
         )
 
