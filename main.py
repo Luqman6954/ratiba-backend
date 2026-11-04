@@ -45,6 +45,22 @@ app = FastAPI(
 
 BASE_URL = "https://ratiba.udom.ac.tz"
 
+CR_REGISTRY_BASE_URL = (
+    os.getenv(
+        "CR_REGISTRY_BASE_URL",
+        "http://127.0.0.1:8000",
+    )
+    .strip()
+    .rstrip("/")
+)
+
+CR_REGISTRY_API_KEY = os.getenv(
+    "CR_REGISTRY_API_KEY",
+    "",
+).strip()
+
+CR_REGISTRY_TIMEOUT_SECONDS = 10
+
 WEEKDAYS = (
     "Monday",
     "Tuesday",
@@ -5288,6 +5304,94 @@ def get_instructors(
 
 
 
+class CRRecognitionRequest(BaseModel):
+    registrationNumber: str
+    course: str
+    studyYear: int
+
+
+def recognize_cr_with_registry(
+    registration_number: str,
+    course: str,
+    study_year: int,
+):
+    if not CR_REGISTRY_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "CR_REGISTRY_NOT_CONFIGURED",
+                "message": (
+                    "CR recognition is temporarily unavailable"
+                ),
+            },
+        )
+
+    try:
+        response = requests.get(
+            (
+                f"{CR_REGISTRY_BASE_URL}"
+                "/api/v1/crs/recognize"
+            ),
+            headers={
+                "X-API-Key": CR_REGISTRY_API_KEY,
+            },
+            params={
+                "registrationNumber": registration_number,
+                "course": course,
+                "studyYear": study_year,
+            },
+            timeout=CR_REGISTRY_TIMEOUT_SECONDS,
+        )
+
+    except requests.RequestException as error:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "CR_REGISTRY_UNAVAILABLE",
+                "message": (
+                    "Could not verify CR status"
+                ),
+            },
+        ) from error
+
+    if response.status_code == 401:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "CR_REGISTRY_AUTH_FAILED",
+                "message": (
+                    "CR verification service authentication failed"
+                ),
+            },
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "CR_REGISTRY_ERROR",
+                "message": (
+                    "CR verification service returned "
+                    "an unexpected response"
+                ),
+            },
+        )
+
+    try:
+        return response.json()
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "CR_REGISTRY_INVALID_RESPONSE",
+                "message": (
+                    "CR verification service returned invalid data"
+                ),
+            },
+        ) from error
+
+
 @app.post("/auth/lecturer/verification/request")
 def request_lecturer_verification(
         request: LecturerVerificationRequest,
@@ -5669,6 +5773,420 @@ def deprecated_auto_provision_lecturer():
             "selecting an instructor manually"
         ),
     )
+
+
+
+class StudentProvisionRequest(BaseModel):
+    name: str
+    registrationNumber: str
+    course: str
+    studyYear: int
+
+    semester: str
+    academicYearId: str
+    semesterId: str
+
+
+def normalize_student_registration_number(
+        value: str | None,
+) -> str:
+    return normalize_whitespace(
+        value
+    ).upper()
+
+
+def normalize_student_programme_code(
+        value: str | None,
+) -> str:
+    return re.sub(
+        r"\s+",
+        "",
+        normalize_whitespace(
+            value
+        ),
+    ).upper()
+
+
+def registry_programme_code(
+        programme_code: str,
+        study_year: int,
+) -> str:
+    """
+    Ratiba programme examples:
+
+        IS3     -> IS
+        CS2     -> CS
+        DM0672  -> DM067
+        DMPH312 -> DMPH31
+
+    The exact selected study-year suffix is removed.
+    """
+
+    value = normalize_student_programme_code(
+        programme_code
+    )
+
+    suffix = str(study_year)
+
+    if (
+        suffix
+        and value.endswith(suffix)
+        and len(value) > len(suffix)
+    ):
+        candidate = value[:-len(suffix)]
+
+        if candidate:
+            return candidate
+
+    return value
+
+
+def normalized_person_name(
+        value: str | None,
+) -> str:
+    return " ".join(
+        normalize_whitespace(
+            value
+        ).split()
+    ).casefold()
+
+
+@app.post("/auth/student/provision")
+def provision_student_account(
+    request: StudentProvisionRequest,
+    authorization: str | None = Header(
+        default=None
+    ),
+):
+    claims = require_verified_firebase_user(
+        authorization
+    )
+
+    uid = claims["uid"]
+
+    submitted_name = normalize_whitespace(
+        request.name
+    )
+
+    registration_number = (
+        normalize_student_registration_number(
+            request.registrationNumber
+        )
+    )
+
+    ratiba_course = (
+        normalize_student_programme_code(
+            request.course
+        )
+    )
+
+    if not submitted_name:
+        _authorization_error(
+            422,
+            "INVALID_NAME",
+            "Student name is required",
+        )
+
+    if not registration_number:
+        _authorization_error(
+            422,
+            "INVALID_REGISTRATION_NUMBER",
+            "Registration number is required",
+        )
+
+    if not ratiba_course:
+        _authorization_error(
+            422,
+            "INVALID_COURSE",
+            "Programme is required",
+        )
+
+    if request.studyYear < 1:
+        _authorization_error(
+            422,
+            "INVALID_STUDY_YEAR",
+            "Study year must be at least 1",
+        )
+
+    registry_course = registry_programme_code(
+        ratiba_course,
+        request.studyYear,
+    )
+
+    result = recognize_cr_with_registry(
+        registration_number,
+        registry_course,
+        request.studyYear,
+    )
+
+    status = normalize_whitespace(
+        result.get("status")
+    ).upper()
+
+    known_statuses = {
+        "VALID",
+        "NOT_CR",
+        "NOT_ACTIVE_CR",
+        "COURSE_MISMATCH",
+        "STUDY_YEAR_MISMATCH",
+    }
+
+    if status not in known_statuses:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "CR_REGISTRY_INVALID_RESPONSE",
+                "message": (
+                    "CR Registry returned an unknown result"
+                ),
+            },
+        )
+
+    role = "STUDENT"
+    verified_cr = False
+    official_name = submitted_name
+    matched_scope = None
+
+    if (
+        status == "VALID"
+        and result.get("recognized") is True
+    ):
+        cr_data = result.get("cr") or {}
+        matched_scope = (
+            result.get("matchedScope")
+            or {}
+        )
+
+        official_registration_number = (
+            normalize_student_registration_number(
+                cr_data.get(
+                    "registrationNumber"
+                )
+            )
+        )
+
+        registry_name = normalize_whitespace(
+            cr_data.get("fullName")
+        )
+
+        official_registry_course = (
+            normalize_student_programme_code(
+                matched_scope.get("course")
+            )
+        )
+
+        try:
+            official_study_year = int(
+                matched_scope.get(
+                    "studyYear"
+                )
+            )
+        except (TypeError, ValueError):
+            official_study_year = 0
+
+        if (
+            official_registration_number
+            != registration_number
+            or official_registry_course
+            != registry_course
+            or official_study_year
+            != request.studyYear
+        ):
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "CR_REGISTRY_SCOPE_MISMATCH",
+                    "message": (
+                        "CR Registry returned inconsistent CR data"
+                    ),
+                },
+            )
+
+        role = "CR"
+        verified_cr = True
+
+        # The student's chosen profile name is not part of
+        # CR authorization. Registry recognition is based on
+        # registration number, programme and study year.
+        official_name = submitted_name
+
+    user_ref = (
+        firestore_db
+        .collection("users")
+        .document(uid)
+    )
+
+    cr_ref = (
+        firestore_db
+        .collection("cr_assignments")
+        .document(uid)
+    )
+
+    batch = firestore_db.batch()
+
+    batch.set(
+        user_ref,
+        {
+            "uid": uid,
+            "fullName": official_name,
+            "registrationNumber": (
+                registration_number
+            ),
+            "role": role,
+            "crRegistryStatus": status,
+            "verificationStatus": (
+                "CR_REGISTRY_VERIFIED"
+                if verified_cr
+                else "STANDARD_STUDENT"
+            ),
+            "accountStatus": "Active",
+            "updatedAtMillis": int(
+                time.time() * 1000
+            ),
+        },
+        merge=True,
+    )
+
+    if verified_cr:
+        course_key = re.sub(
+            r"\s+",
+            "",
+            ratiba_course,
+        ).upper()
+
+        batch.set(
+            cr_ref,
+            {
+                "uid": uid,
+                "role": "CR",
+                "active": True,
+                "verified": True,
+
+                "registrationNumber": (
+                    registration_number
+                ),
+                "fullName": official_name,
+
+                # Ratiba programme code, e.g. IS3
+                "course": ratiba_course,
+                "courseKey": course_key,
+
+                # Registry programme code, e.g. IS
+                "registryCourse": registry_course,
+
+                "studyYear": request.studyYear,
+                "year": (
+                    f"Year {request.studyYear}"
+                ),
+
+                "semester": normalize_whitespace(
+                    request.semester
+                ),
+
+                "academicYearId": (
+                    normalize_whitespace(
+                        request.academicYearId
+                    )
+                ),
+
+                "semesterId": (
+                    normalize_whitespace(
+                        request.semesterId
+                    )
+                ),
+
+                "academicYear": (
+                    normalize_whitespace(
+                        matched_scope.get(
+                            "academicYear"
+                        )
+                    )
+                ),
+
+                "collegeCode": (
+                    normalize_whitespace(
+                        matched_scope.get(
+                            "collegeCode"
+                        )
+                    )
+                ),
+
+                "collegeName": (
+                    normalize_whitespace(
+                        matched_scope.get(
+                            "collegeName"
+                        )
+                    )
+                ),
+
+                "programmeName": (
+                    normalize_whitespace(
+                        matched_scope.get(
+                            "programmeName"
+                        )
+                    )
+                ),
+
+                "crType": (
+                    normalize_whitespace(
+                        matched_scope.get(
+                            "crType"
+                        )
+                    )
+                ),
+
+                "authorizationSource": (
+                    "CR_REGISTRY"
+                ),
+
+                "registryStatus": "VALID",
+
+                "verifiedAt": (
+                    firestore.SERVER_TIMESTAMP
+                ),
+
+                "updatedAt": (
+                    firestore.SERVER_TIMESTAMP
+                ),
+            },
+            merge=True,
+        )
+
+    else:
+        batch.set(
+            cr_ref,
+            {
+                "uid": uid,
+                "role": "STUDENT",
+                "active": False,
+                "verified": False,
+                "registrationNumber": (
+                    registration_number
+                ),
+                "authorizationSource": (
+                    "CR_REGISTRY"
+                ),
+                "registryStatus": status,
+                "updatedAt": (
+                    firestore.SERVER_TIMESTAMP
+                ),
+            },
+            merge=True,
+        )
+
+    batch.commit()
+
+    return {
+        "uid": uid,
+        "role": role,
+        "recognized": verified_cr,
+        "registryStatus": status,
+        "officialName": (
+            official_name
+            if verified_cr
+            else None
+        ),
+    }
 
 
 @app.get("/auth/me")

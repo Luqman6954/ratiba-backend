@@ -327,6 +327,20 @@ def main() -> int:
     try:
         for index, entry in enumerate(shortlisted, start=1):
             try:
+                known_unavailable = {
+                    "Julius Sebastian Missanga",
+                }
+
+                if entry.full_name in known_unavailable:
+                    unavailable.append(entry.full_name)
+                    print(
+                        f"SKIP {entry.full_name}: "
+                        "UDOM profile persistently unavailable; "
+                        "manual verification required",
+                        file=sys.stderr,
+                    )
+                    continue
+
                 profile = fetch_staff_profile_with_retry(
                     session,
                     entry,

@@ -6,3 +6,5 @@ venv/
 .vercel/
 .secrets/
 *.json
+.vercel
+.env*
