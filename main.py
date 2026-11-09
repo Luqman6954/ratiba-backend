@@ -48,7 +48,7 @@ BASE_URL = "https://ratiba.udom.ac.tz"
 CR_REGISTRY_BASE_URL = (
     os.getenv(
         "CR_REGISTRY_BASE_URL",
-        "http://127.0.0.1:8000",
+        "https://udom-cr-registry.onrender.com",
     )
     .strip()
     .rstrip("/")
